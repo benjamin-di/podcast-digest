@@ -7,6 +7,7 @@ pytest.importorskip("fastmcp")
 
 from starlette.testclient import TestClient
 
+from podcast_digest import __version__
 from podcast_digest_mcp.server import build_app
 
 INIT = {
@@ -51,6 +52,6 @@ def test_foreign_host_and_origin_are_served(monkeypatch, tmp_path):
     with TestClient(app) as client:
         response = client.post("/mcp", json=INIT, headers=foreign)
         assert response.status_code == 200, response.text
-        assert response.json()["result"]["serverInfo"]
+        assert response.json()["result"]["serverInfo"]["version"] == __version__
         health = client.get("/health", headers={"Host": "10.0.0.7:8000"})
         assert health.status_code == 200, health.text

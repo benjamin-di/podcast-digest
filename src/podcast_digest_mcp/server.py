@@ -16,7 +16,7 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from podcast_digest import USER_AGENT
+from podcast_digest import USER_AGENT, __version__
 from podcast_digest.net import validate_async_request, validate_request
 
 from . import tools
@@ -49,6 +49,7 @@ def build_app():
 
     mcp = FastMCP(
         "podcast-digest",
+        version=__version__,  # serverInfo: this package's version, not FastMCP's
         # Header bearer only: tokens in URLs end up in access logs.
         auth=StaticTokenVerifier(tokens={token: {"client_id": "bearer", "scopes": []}}),
         # Unexpected exceptions reach clients as a generic error, not their

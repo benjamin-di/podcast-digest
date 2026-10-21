@@ -18,8 +18,36 @@ env:
   ENGINE_IMAGE: ghcr.io/${{ github.repository_owner }}/podcast-digest-engine
   MCP_IMAGE: ghcr.io/${{ github.repository_owner }}/podcast-digest-mcp-server
 
+# GitHub can deliver one tag push twice: the runs of a ref queue one behind the other, and a
+# run whose tag already has a GitHub release (the last job) stops at `released`.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  released:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      done: ${{ steps.check.outputs.done }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          done=false
+          if [ "$GITHUB_REF_TYPE" = tag ] && gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            done=true
+            echo "$TAG is already released: nothing to do"
+          fi
+          echo "done=$done" >> "$GITHUB_OUTPUT"
+
   check:
+    needs: released
+    if: needs.released.outputs.done != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -150,3 +178,16 @@ jobs:
               test "$(docker buildx imagetools inspect "$repo:$alias" --format '{{json .Manifest}}' | jq -r .digest)" = "$digest"
             done
           done
+
+  github-release:
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --generate-notes

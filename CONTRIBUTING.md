@@ -23,6 +23,14 @@ mocked. Please:
 [AGENTS.md](AGENTS.md) describes the code layout and the invariants that matter
 (the resumable state machine, deduplication, delivery semantics).
 
+## How changes land
+
+Each release of this repository is exported from a private working repository as one
+`Release X.Y.Z` commit, so pull requests are not merged here: the next release would replace
+them. When a change fits, the maintainer applies it there, credits you in the release notes
+and closes the pull request with a link to the release that contains it. Issues are welcome;
+answers are best effort.
+
 ## Reporting bugs
 
 Include the version (`podcast-digest --version`, or the image tag), the
