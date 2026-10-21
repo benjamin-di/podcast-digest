@@ -1,0 +1,152 @@
+name: Release
+
+# On a vX.Y.Z tag: run the checks, build the three images once, smoke-test each
+# exact digest, then publish it under the version, sha-<12>, X.Y, X and latest.
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      candidate_only:
+        description: Build and verify without promoting release tags
+        type: boolean
+        default: true
+
+env:
+  TRANSCRIBER_IMAGE: ghcr.io/${{ github.repository_owner }}/podcast-digest-transcriber
+  ENGINE_IMAGE: ghcr.io/${{ github.repository_owner }}/podcast-digest-engine
+  MCP_IMAGE: ghcr.io/${{ github.repository_owner }}/podcast-digest-mcp-server
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - run: uv python install 3.12
+      - run: ./scripts/check
+
+  build-and-push:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 120  # the OpenVINO/Torch transcriber cold, plus an arm64 MCP build
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - id: source
+        name: Validate source and release version
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            test "${GITHUB_REF_NAME#v}" = "$version"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build transcriber candidate
+        id: transcriber
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          target: transcriber-runtime
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.TRANSCRIBER_IMAGE }}:candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.description=whisper.cpp (OpenVINO) local transcriber used by podcast-digest
+          build-args: SOURCE_REVISION=${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.TRANSCRIBER_IMAGE }}:buildcache
+          cache-to: type=registry,mode=max,ref=${{ env.TRANSCRIBER_IMAGE }}:buildcache
+          provenance: mode=max
+          sbom: true
+      - name: Smoke transcriber digest
+        run: bash scripts/smoke-image.sh transcriber "$TRANSCRIBER_IMAGE@${{ steps.transcriber.outputs.digest }}" "${{ github.sha }}" "${{ steps.source.outputs.version }}"
+
+      - name: Build engine from the transcriber digest
+        id: engine
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.podcast
+          target: podcast-runtime
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.ENGINE_IMAGE }}:candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.description=podcast-digest: transcribe new podcast episodes and email a summary
+          build-args: TRANSCRIBER_IMAGE=${{ env.TRANSCRIBER_IMAGE }}@${{ steps.transcriber.outputs.digest }}
+          cache-from: type=registry,ref=${{ env.ENGINE_IMAGE }}:buildcache
+          cache-to: type=registry,mode=max,ref=${{ env.ENGINE_IMAGE }}:buildcache
+          provenance: mode=max
+          sbom: true
+      - name: Smoke engine digest
+        run: bash scripts/smoke-image.sh podcast "$ENGINE_IMAGE@${{ steps.engine.outputs.digest }}" "${{ github.sha }}" "${{ steps.source.outputs.version }}"
+
+      - name: Build MCP candidate (amd64 + arm64)
+        id: mcp
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.mcp
+          target: mcp-runtime
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.MCP_IMAGE }}:candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.description=podcast-digest MCP server: manage subscriptions from Claude
+          cache-from: type=registry,ref=${{ env.MCP_IMAGE }}:buildcache
+          cache-to: type=registry,mode=max,ref=${{ env.MCP_IMAGE }}:buildcache
+          provenance: mode=max
+          sbom: true
+      - name: Smoke MCP digest
+        run: bash scripts/smoke-image.sh mcp "$MCP_IMAGE@${{ steps.mcp.outputs.digest }}" "${{ github.sha }}" "${{ steps.source.outputs.version }}"
+
+      - name: Record tested digests
+        run: |
+          {
+            echo "transcriber: ${{ steps.transcriber.outputs.digest }}"
+            echo "engine: ${{ steps.engine.outputs.digest }}"
+            echo "mcp: ${{ steps.mcp.outputs.digest }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Promote the tested digests
+        if: ${{ github.ref_type == 'tag' && !inputs.candidate_only }}
+        env:
+          VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          for item in "$TRANSCRIBER_IMAGE=${{ steps.transcriber.outputs.digest }}" \
+                      "$ENGINE_IMAGE=${{ steps.engine.outputs.digest }}" \
+                      "$MCP_IMAGE=${{ steps.mcp.outputs.digest }}"; do
+            repo="${item%%=*}"
+            digest="${item#*=}"
+            bash scripts/promote-image.sh "$repo" "$digest" "$VERSION"
+            bash scripts/promote-image.sh "$repo" "$digest" "sha-${GITHUB_SHA:0:12}"
+            for alias in latest "${VERSION%.*}" "${VERSION%%.*}"; do
+              docker buildx imagetools create --tag "$repo:$alias" "$repo@$digest"
+              test "$(docker buildx imagetools inspect "$repo:$alias" --format '{{json .Manifest}}' | jq -r .digest)" = "$digest"
+            done
+          done

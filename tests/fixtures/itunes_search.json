@@ -1,0 +1,18 @@
+{
+  "resultCount": 1,
+  "results": [
+    {
+      "wrapperType": "track",
+      "kind": "podcast",
+      "collectionId": 1234567890,
+      "trackId": 1234567890,
+      "artistName": "Test Studio",
+      "collectionName": "The Test Podcast",
+      "trackName": "The Test Podcast",
+      "collectionViewUrl": "https://example.com/podcast",
+      "feedUrl": "https://example.com/feed.xml",
+      "trackViewUrl": "https://example.com/podcast",
+      "primaryGenreName": "Business"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+# The release workflow supplies the immutable digest produced by the
+# transcriber build in the same run. Local builds point it at a transcriber
+# image built from deploy/Dockerfile (--target transcriber-runtime) or any
+# compatible published one.
+ARG TRANSCRIBER_IMAGE=local-transcriber:latest
+FROM ${TRANSCRIBER_IMAGE} AS podcast-runtime
+
+USER root
+WORKDIR /app
+COPY pyproject.toml README.md /app/
+COPY src /app/src
+RUN /opt/venv/bin/pip install -e .
+
+COPY feeds.toml /app/feeds.toml
+
+ENV WHISPER_MODEL_DIR=/data/models \
+    PODCAST_DIGEST_DATA_DIR=/data \
+    PODCAST_DIGEST_CONFIG=/app/feeds.toml \
+    PODCAST_DIGEST_WHISPER_BIN=/usr/local/bin/whisper-cli \
+    PODCAST_DIGEST_WHISPER_MODEL=/data/models/ggml-medium.en.bin \
+    PODCAST_DIGEST_WHISPER_LD_PATH=/usr/local/lib/whisper:/opt/intel/openvino/runtime/lib/intel64
+
+HEALTHCHECK --interval=5m --timeout=10s --start-period=10m --start-interval=2s --retries=3 \
+    CMD pgrep -f "podcast_digest.*serve|podcast-digest serve" >/dev/null || exit 1
+
+CMD ["podcast-digest", "serve"]

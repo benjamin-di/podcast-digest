@@ -1,0 +1,71 @@
+# Quickstart: build and run podcast-digest, optionally with its MCP server.
+#
+#   mkdir -p config && cp feeds.toml config/feeds.toml   # then edit it
+#   cp example.env .env                                  # then fill it in
+#   docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
+#   docker compose --env-file .env -f deploy/docker-compose.yml --profile mcp up -d --build
+#
+# Run from the repository root. Paths are relative to this file; --env-file
+# makes the root .env available for the ${…} below. See README.md for every
+# setting.
+
+services:
+  podcast-digest:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: podcast-runtime
+    image: podcast-digest:local
+    container_name: podcast-digest
+    # The OpenVINO base image exists for x86-64 only. On ARM hosts (Apple
+    # Silicon) this builds and runs under emulation — slow; see README.
+    platform: linux/amd64
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      PODCAST_DIGEST_CONFIG: /config/feeds.toml
+    volumes:
+      # Models, transcripts, audio in flight and state.db (keep it persistent).
+      - podcast-digest-data:/data
+      # feeds.toml lives in a directory so the MCP can replace it atomically.
+      - ../config:/config
+    security_opt:
+      - no-new-privileges:true
+    # Lets PODCAST_DIGEST_OPENAI_BASE_URL reach a model server on the Docker host
+    # (e.g. Ollama) as host.docker.internal, also on Linux.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Intel iGPU (OpenVINO) acceleration: uncomment on hosts that have one.
+    # Without it whisper.cpp runs on the CPU — slower, same result.
+    # devices:
+    #   - /dev/dri:/dev/dri
+
+  # Optional: an MCP server to list/add/remove feeds from Claude (phone or
+  # desktop) and trigger processing. Put it behind a TLS reverse proxy before
+  # exposing it beyond localhost; clients send PODCAST_MCP_BEARER_TOKEN.
+  podcast-digest-mcp:
+    profiles: ["mcp"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.mcp
+    image: podcast-digest-mcp:local
+    container_name: podcast-digest-mcp
+    restart: unless-stopped
+    # Runs as you (PUID/PGID in .env, default 1000) so it can rewrite
+    # ../config/feeds.toml.
+    user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      # Only the token, not the whole .env: the MCP needs no other secret. It
+      # refuses to start without one.
+      PODCAST_MCP_BEARER_TOKEN: ${PODCAST_MCP_BEARER_TOKEN:-}
+      PODCAST_DIGEST_CONFIG: /config/feeds.toml
+    volumes:
+      - ../config:/config
+    ports:
+      - "127.0.0.1:8000:8000"
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  podcast-digest-data:

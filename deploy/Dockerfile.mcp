@@ -1,0 +1,54 @@
+# ============================================================================
+# podcast-digest-mcp
+#
+# Small FastMCP server that exposes a mobile-friendly tool surface (subscribe,
+# preview, list, remove, process now) for the podcast-digest project. Writes feeds.toml in
+# response to mobile ingest calls; the digest container reads it on the next
+# poll tick. No download / transcribe / summarize logic — that all stays in
+# the digest image.
+#
+# Image is intentionally thin (python:3.12-slim, no OpenVINO / no torch / no
+# whisper.cpp). yt-dlp comes in as part of the podcast-digest package (already
+# a hard dependency for the `youtube` / `youtube_video` feed sources upstream).
+# ============================================================================
+
+FROM python:3.12-slim AS mcp-runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy package metadata first so the dep install layer caches separately from
+# source changes.
+COPY pyproject.toml uv.lock README.md LICENSE NOTICE ./
+COPY packages/local-transcriber ./packages/local-transcriber
+COPY src ./src
+
+RUN pip install --no-cache-dir -e ./packages/local-transcriber \
+ && pip install --no-cache-dir ".[mcp]"
+
+RUN useradd -u 1001 -m -s /usr/sbin/nologin mcp && \
+    mkdir -p /app/config && \
+    chown -R mcp:mcp /app
+
+USER mcp
+
+ENV HOST=0.0.0.0 \
+    PORT=8000 \
+    LOG_LEVEL=info \
+    PODCAST_DIGEST_CONFIG=/app/config/feeds.toml
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=60s --timeout=5s --start-period=2m --start-interval=2s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8000/health || exit 1
+
+CMD ["python", "-m", "podcast_digest_mcp"]

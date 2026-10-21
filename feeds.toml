@@ -1,0 +1,75 @@
+# EXAMPLE subscriptions — copy to config/feeds.toml (see README "Quickstart")
+# and replace the example feeds below with your own: their names, addresses and
+# IDs are placeholders. Validate with `podcast-digest check-config path/to/feeds.toml`.
+#
+# Each feed needs exactly one source:
+#   - `rss_url`       pinned podcast RSS URL (preferred)
+#   - `search`        podcast name, resolved via the iTunes Search API
+#   - `youtube`       a YouTube channel (channel URL, @handle, UC… id, or
+#                     videos.xml URL) — newest video per tick, like a podcast
+#   - `youtube_video` a single YouTube watch URL — transcribed/summarized once
+#   - `audio_url`     a single direct audio URL — transcribed/summarized once
+# `min_minutes` skips short teasers/promos/soundbites below that length. The
+# file-level `min_minutes` below is the global floor applied to every feed; a
+# per-feed `min_minutes` overrides it (set `0` to opt a feed out). Enforced
+# against the declared RSS duration AND — for every recurring source, including
+# YouTube channels — against the real audio duration measured (ffprobe) right
+# before transcription, so clips with missing/wrong declared durations are still
+# caught. One-off sources (`youtube_video`, `audio_url`) are exempt. YouTube
+# sources need `yt-dlp` (bundled in the image).
+#
+# `language` marks a non-English feed by ISO 639-1 code ("zh" for Mandarin,
+# "ja", "de", …; unset or "en" = English, unchanged). Such feeds transcribe
+# with the multilingual whisper model (PODCAST_DIGEST_WHISPER_MODEL_MULTILINGUAL,
+# `-l <code>`) and the digest email is still an English summary, with a
+# "Translated from <language>" note. The deploy must download the multilingual
+# model: set PODCAST_DIGEST_WHISPER_MODELS="medium.en large-v3-turbo" (see
+# deploy/prepare-models.sh). Titles are never translated — the delivery log
+# dedupes on (show, title).
+#
+# `publisher_transcripts` (default true): when an episode links its own
+# transcript (Podcasting 2.0 <podcast:transcript>), use it instead of
+# transcribing the audio. Set false for a feed whose transcripts are poor.
+#
+# `webhook` (default true) includes a feed's emailed episodes in the delivery
+# webhook — only when one is configured (PODCAST_DIGEST_WEBHOOK_URL). Set
+# `webhook = false` to leave a feed out (e.g. pure entertainment).
+
+# Comma-separated list — the digest goes to all of these.
+recipient = "you@example.com"
+# Seconds between feed polls (default 6 h). If you monitor the heartbeat
+# (PODCAST_DIGEST_HEARTBEAT_URL), its window must exceed poll_seconds + 600 s of
+# scheduler jitter + a slow tick — e.g. period 6 h, grace 2 h.
+poll_seconds = 21600
+# Global minimum episode length (minutes). Anything shorter is skipped before
+# transcription. Per-feed `min_minutes` overrides; set a feed's to 0 to opt out.
+min_minutes = 5
+
+# A podcast resolved by name via the iTunes Search API.
+[[feeds]]
+name = "Market Hours"
+search = "Market Hours"
+min_minutes = 15
+
+# A podcast with a pinned RSS URL (preferred over `search`).
+[[feeds]]
+name = "Company Histories"
+rss_url = "https://feeds.example.com/company-histories.xml"
+min_minutes = 15
+
+# A Mandarin podcast — original title kept (dedup keys on it), transcribed in
+# Chinese with the multilingual model, digest arrives as an English summary.
+[[feeds]]
+name = "示例播客"
+rss_url = "https://feeds.example.com/example-mandarin-show.xml"
+language = "zh"
+
+# A YouTube channel — newest upload per tick, like a podcast.
+[[feeds]]
+name = "Lecture Hall"
+youtube = "UCexampleChannelId000000"  # @lecturehall
+
+# A single YouTube video — transcribed/summarized/emailed exactly once.
+[[feeds]]
+name = "A talk I want once"
+youtube_video = "https://www.youtube.com/watch?v=exampleVid1"

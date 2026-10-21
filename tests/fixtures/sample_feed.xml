@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+  <channel>
+    <title>The Test Podcast</title>
+    <link>https://example.com/podcast</link>
+    <description>Test feed</description>
+    <language>en-us</language>
+
+    <item>
+      <title>Episode 3: Long episode</title>
+      <description><![CDATA[<p>Show notes for episode three.</p>]]></description>
+      <pubDate>Tue, 02 Apr 2024 10:00:00 +0000</pubDate>
+      <guid isPermaLink="false">ep-3-guid</guid>
+      <enclosure url="https://cdn.example.com/ep3.mp3" length="86000000" type="audio/mpeg"/>
+      <itunes:duration>01:30:00</itunes:duration>
+    </item>
+
+    <item>
+      <title>Episode 2: Medium episode</title>
+      <description>Plain description.</description>
+      <pubDate>Tue, 26 Mar 2024 10:00:00 +0000</pubDate>
+      <guid isPermaLink="false">ep-2-guid</guid>
+      <enclosure url="https://cdn.example.com/ep2.mp3" length="50000000" type="audio/mpeg"/>
+      <itunes:duration>45:00</itunes:duration>
+    </item>
+
+    <item>
+      <title>Episode 1: Short teaser</title>
+      <pubDate>Tue, 19 Mar 2024 10:00:00 +0000</pubDate>
+      <guid isPermaLink="false">ep-1-guid</guid>
+      <enclosure url="https://cdn.example.com/ep1.mp3" length="5000000" type="audio/mpeg"/>
+      <itunes:duration>180</itunes:duration>
+    </item>
+  </channel>
+</rss>

@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+.env
+.env.*
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# Local data (only emitted at runtime)
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Quickstart config (deploy/docker-compose.yml)
+config/

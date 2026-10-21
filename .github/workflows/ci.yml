@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.3.2
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install Python 3.12
+        run: uv python install 3.12
+
+      - name: Verify
+        run: ./scripts/check
+
+      # One hadolint run over every Dockerfile. Ignored rules fire on
+      # intentional patterns:
+      #   DL3008 — apt-get install without pinning versions (distro packages
+      #            from the official OpenVINO base)
+      #   DL3013 — pip install without pinning (torch + openvino are pinned;
+      #            ranges on others are deliberate)
+      #   DL3002 — last USER should not be root. The engine runs as root for
+      #            GPU device access; the compose file adds security_opt.
+      # error-only: catch real bugs (bad COPY paths, missing shells,
+      # malformed CMD), not style.
+      - name: Lint Dockerfiles (hadolint)
+        run: |
+          mapfile -t dockerfiles < <(git ls-files 'Dockerfile*' '**/Dockerfile*')
+          docker run --rm -v "$PWD:/src:ro" -w /src ghcr.io/hadolint/hadolint:v2.14.0 \
+            hadolint --failure-threshold error \
+              --ignore DL3008 --ignore DL3013 --ignore DL3002 \
+              "${dockerfiles[@]}"

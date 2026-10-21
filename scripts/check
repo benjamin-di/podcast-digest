@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_dir"
+
+uv sync --all-extras --frozen
+uv run ruff check src tests packages/local-transcriber/src packages/local-transcriber/tests
+uv run mypy src packages/local-transcriber/src
+uv run pytest --tb=short
+uv run podcast-digest check-config feeds.toml
