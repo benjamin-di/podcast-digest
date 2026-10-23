@@ -13,21 +13,21 @@
 # land in /data/models, which should be a persistent volume.
 # ============================================================================
 
-ARG OPENVINO_VERSION=2024.6.0
+ARG OPENVINO_IMAGE=openvino/ubuntu24_runtime:2026.4.1@sha256:ef00731944b89db0148ff41bae9ef5f581dc9a1a2de90b1dd9a8ce1af69dc7b5
 ARG SOURCE_REVISION=unknown
 
 # ----------------------------------------------------------------------------
 # Stage 1: build whisper-cli
 # ----------------------------------------------------------------------------
-FROM openvino/ubuntu24_runtime:${OPENVINO_VERSION} AS whisper-builder
+FROM ${OPENVINO_IMAGE} AS whisper-builder
 USER root
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get upgrade -y --no-install-recommends && apt-get install -y --no-install-recommends \
         build-essential cmake git ca-certificates \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-ARG WHISPER_CPP_REF=v1.7.4
+ARG WHISPER_CPP_REF=v1.9.5
 WORKDIR /src
 RUN git clone --depth 1 --branch ${WHISPER_CPP_REF} \
         https://github.com/ggerganov/whisper.cpp.git
@@ -53,10 +53,10 @@ RUN bash -lc '. /opt/intel/openvino/setupvars.sh && \
 # ----------------------------------------------------------------------------
 # Stage 2: runtime
 # ----------------------------------------------------------------------------
-FROM openvino/ubuntu24_runtime:${OPENVINO_VERSION} AS transcriber-runtime
+FROM ${OPENVINO_IMAGE} AS transcriber-runtime
 USER root
 
-ARG WHISPER_CPP_REF=v1.7.4
+ARG WHISPER_CPP_REF=v1.9.5
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -71,7 +71,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 #   libze-intel-gpu1  — Intel Level Zero GPU driver
 # Without these, OpenVINO's GPU plugin reports "no supported devices found" and
 # whisper.cpp silently falls back to CPU despite -oved GPU + /dev/dri.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get upgrade -y --no-install-recommends && apt-get install -y --no-install-recommends \
         python3.12 python3.12-venv python3-pip \
         ffmpeg curl ca-certificates tini \
         openssh-client \
@@ -104,7 +104,7 @@ ENV PATH="/opt/venv/bin:${PATH}"
 # installed so first-run conversion is just a CPU/disk job, not a pip install.
 # torch CPU wheel is much smaller than the default CUDA one.
 #
-# openai-whisper==20240930's setup.py does `import pkg_resources`, which current
+# The Whisper setup.py uses `pkg_resources`, which current
 # setuptools (>=81) no longer ships. Seed the venv with setuptools<81 + wheel and
 # build whisper with --no-build-isolation so it uses that setuptools instead of
 # pip pulling a newer one into an isolated build env.
@@ -113,14 +113,15 @@ ENV PATH="/opt/venv/bin:${PATH}"
 # torch model -> ONNX (torch.onnx.export, which needs `onnx`) -> OpenVINO IR.
 # Without it the conversion fails ("Module onnx is not installed!") and
 # whisper.cpp silently falls back to CPU instead of the Intel iGPU.
-RUN /opt/venv/bin/pip install --upgrade pip==25.1.1 setuptools==80.9.0 wheel==0.45.1 \
+RUN /opt/venv/bin/pip install --upgrade pip==26.2.2 setuptools==80.9.0 wheel==0.48.0 \
  && /opt/venv/bin/pip install \
-        torch==2.4.1 --index-url https://download.pytorch.org/whl/cpu \
+        torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu \
  && /opt/venv/bin/pip install --no-build-isolation \
-        openai-whisper==20240930 \
+        openai-whisper==20250625 \
  && /opt/venv/bin/pip install \
-        openvino==2024.6.0 \
-        onnx==1.17.0
+        openvino==2026.4.1 \
+        onnx==1.23.2 \
+ && /opt/venv/bin/pip install --upgrade setuptools==84.2.1 urllib3==2.8.0 certifi==2026.10.19
 
 # Reusable transcriber package. This stage is also published directly as the
 # local-transcriber image, for other jobs that need local transcription.

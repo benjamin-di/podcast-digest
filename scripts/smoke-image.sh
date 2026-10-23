@@ -21,6 +21,8 @@ case "$variant" in
           podcast-digest check-config /app/feeds.toml
         fi
       '
+    docker run --rm -i --network none --read-only --tmpfs /tmp --entrypoint python \
+      "$image" - < scripts/smoke-openvino.py
     ;;
   mcp)
     cid="$(docker run -d --network none --read-only --tmpfs /tmp \

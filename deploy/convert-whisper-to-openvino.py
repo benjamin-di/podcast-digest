@@ -1,17 +1,18 @@
 """Convert a Whisper encoder to OpenVINO IR for whisper.cpp iGPU acceleration.
 
-Vendored from whisper.cpp (models/convert-whisper-to-openvino.py) with one fix:
+Vendored from whisper.cpp (models/convert-whisper-to-openvino.py) with compatibility fixes:
 the upstream script does `from openvino.tools import mo`, but `openvino.tools.mo`
 (the legacy Model Optimizer) was removed in OpenVINO 2024.x — and the import is
 dead code anyway (the conversion goes through the ONNX frontend + `serialize`,
-never `mo`). Dropping that import lets the conversion run on OpenVINO 2024.6.
+never `mo`). Use the public serialize API and an explicit legacy ONNX exporter/opset so
+security updates to Torch and OpenVINO keep the encoder interchange format stable.
 """
 import argparse
 import torch
 from whisper import load_model
 import os
 from openvino.frontend import FrontEndManager
-from openvino.runtime import serialize
+from openvino import serialize
 import shutil
 
 def convert_encoder(hparams, encoder, mname):
@@ -33,7 +34,9 @@ def convert_encoder(hparams, encoder, mname):
         mel,
         onnx_path,
         input_names=["mel"],
-        output_names=["output_features"]
+        output_names=["output_features"],
+        opset_version=17,
+        dynamo=False,
     )
 
     # Convert ONNX to OpenVINO IR format using the frontend

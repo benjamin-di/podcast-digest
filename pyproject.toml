@@ -1,6 +1,6 @@
 [project]
 name = "podcast-digest"
-version = "0.4.3"
+version = "0.4.5"
 description = "Follow podcasts and YouTube, transcribe locally with whisper.cpp, email an LLM-written summary of every new episode."
 readme = "README.md"
 license = "MIT"
