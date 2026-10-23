@@ -32,7 +32,8 @@ COPY pyproject.toml uv.lock README.md LICENSE NOTICE ./
 COPY packages/local-transcriber ./packages/local-transcriber
 COPY src ./src
 
-RUN pip install --no-cache-dir -e ./packages/local-transcriber \
+RUN python -m pip install --no-cache-dir --upgrade pip==26.2.0 \
+ && pip install --no-cache-dir -e ./packages/local-transcriber \
  && pip install --no-cache-dir ".[mcp]"
 
 RUN useradd -u 1001 -m -s /usr/sbin/nologin mcp && \
