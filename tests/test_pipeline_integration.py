@@ -1446,33 +1446,39 @@ async def test_delayed_feed_redirect_to_internal_address_is_blocked(
     assert not internal.called
 
 
-async def test_mail_probably_delivered_marks_sent_without_duplicate(
-    settings, db, feeds_file, mock_llm, mock_transcribe, mock_http, tmp_path,
+async def test_unknown_delivery_is_held_without_false_sent_or_duplicate(
+    settings, db, feeds_file, mock_llm, mock_transcribe, mock_http, tmp_path, caplog, monkeypatch,
 ):
-    """F9: a response-phase timeout AFTER the request was fully transmitted to
-    Graph means the send almost certainly happened — the episode must be marked
-    emailed (+ recorded in the emitted log) instead of re-sending up to
-    MAX_ATTEMPTS duplicate digests."""
-    from podcast_digest.mail import MailProbablyDelivered
+    from podcast_digest.mail import MailOutcomeUnknown
 
+    from .test_pipeline_webhook import FakeIngestor
+
+    ingestor = FakeIngestor()
+    monkeypatch.setattr("podcast_digest.pipeline._build_webhook", lambda _settings: ingestor)
     log_path = tmp_path / "emitted.tsv"
     settings.PODCAST_DIGEST_EMITTED_LOG = str(log_path)
-    mailer = FakeMailer(fail=True, exc=MailProbablyDelivered("response timed out"))
-
+    mailer = FakeMailer(fail=True, exc=MailOutcomeUnknown("response timed out"))
     stats = await run_tick(settings=settings, feeds_file=feeds_file,
                            db=db, mailer=mailer, dry_run=False)
-    assert stats["emailed"] == 1 and stats["failed"] == 0
+    assert stats["emailed"] == 0 and stats["failed"] == 1
     ep = db.get_episode(FEED_URL, NEWEST_GUID)
-    assert ep.status == "emailed"
-    assert ep.terminal_reason == "sent"
-    assert ep.emailed_at is not None
-    assert NEWEST_GUID in log_path.read_text()  # shared delivery record still written
+    assert (ep.status, ep.terminal_reason, ep.emailed_at) == ("summarized", None, None)
+    assert ep.attempts == 0
+    assert ep.audio_path and Path(ep.audio_path).exists()
+    assert not log_path.exists() and ingestor.pushes == []
+    delivery = db.get_delivery(FEED_URL, NEWEST_GUID)
+    assert delivery.state == "unknown" and delivery.receipt is None
+    assert f"delivery inspect {delivery.operation_id}" in caplog.text
 
-    # Next tick with a healthy mailer: nothing to re-send.
-    mailer2 = FakeMailer()
-    s2 = await run_tick(settings=settings, feeds_file=feeds_file,
-                        db=db, mailer=mailer2, dry_run=False)
-    assert s2["emailed"] == 0 and mailer2.sent == []
+    good = FakeMailer()
+    for _ in range(MAX_ATTEMPTS + 1):
+        later = await run_tick(settings=settings, feeds_file=feeds_file,
+                               db=db, mailer=good, dry_run=False)
+        assert later["emailed"] == 0
+    assert good.sent == []
+    ep = db.get_episode(FEED_URL, NEWEST_GUID)
+    assert ep.status == "summarized" and ep.attempts == 0
+    assert Path(ep.audio_path).exists()
 
 
 async def test_summary_sanitized_at_production_choke_point(
@@ -1674,6 +1680,8 @@ async def test_mandarin_feed_multilingual_model_english_summary(
     )
     log_path = tmp_path / "emitted.tsv"
     settings.PODCAST_DIGEST_EMITTED_LOG = str(log_path)
+    settings.PODCAST_DIGEST_QWEN_MODEL_DIR = tmp_path / "qwen"
+    settings.PODCAST_DIGEST_QWEN_THREADS = 5
     mailer = FakeMailer()
 
     stats = await run_tick(
@@ -1681,11 +1689,13 @@ async def test_mandarin_feed_multilingual_model_english_summary(
     )
 
     assert stats["emailed"] == 1
-    # Transcription selected the multilingual model with `-l zh`.
+    # Transcription received Qwen and the multilingual Whisper fallback.
     assert len(mock_transcribe.calls) == 1
     call = mock_transcribe.calls[0]
     assert call["model_path"] == str(settings.PODCAST_DIGEST_WHISPER_MODEL_MULTILINGUAL)
     assert call["language"] == "zh"
+    assert call["qwen_model_dir"] == tmp_path / "qwen"
+    assert call["qwen_threads"] == 5
     # The summarizer got the source language (its output stays English).
     assert mock_llm.calls[0]["source_language"] == "zh"
     # One English email with the translation note; subject/title untouched.
@@ -1701,11 +1711,12 @@ async def test_mandarin_feed_multilingual_model_english_summary(
     assert cols[4] == "Episode 3: Long episode"
 
 
-async def test_english_feed_regression_keeps_en_model_and_no_note(
-    settings, db, feeds_file, mock_llm, mock_transcribe, mock_http,
+async def test_english_feed_configures_parakeet_and_keeps_english_fallback(
+    settings, db, feeds_file, mock_llm, mock_transcribe, mock_http, tmp_path,
 ):
-    """No `language` in feeds.toml → the English path is byte-for-byte what it
-    was: .en model, `-l en`, no source_language, no translation note."""
+    """The default English feed passes both local model choices to transcription."""
+    settings.PODCAST_DIGEST_PARAKEET_MODEL_DIR = tmp_path / "parakeet"
+    settings.PODCAST_DIGEST_PARAKEET_THREADS = 5
     mailer = FakeMailer()
 
     stats = await run_tick(
@@ -1716,5 +1727,201 @@ async def test_english_feed_regression_keeps_en_model_and_no_note(
     call = mock_transcribe.calls[0]
     assert call["model_path"] == str(settings.PODCAST_DIGEST_WHISPER_MODEL)
     assert call["language"] == "en"
+    assert call["parakeet_model_dir"] == tmp_path / "parakeet"
+    assert call["parakeet_threads"] == 5
     assert mock_llm.calls[0]["source_language"] is None
     assert "Translated from" not in mailer.sent[0]["body_html"]
+
+
+class _DeliveryCrash(BaseException):
+    pass
+
+
+async def test_failed_intent_persistence_never_calls_mailer(
+    settings, db, feeds_file, mock_llm, mock_transcribe, mock_http, monkeypatch,
+):
+    import sqlite3
+
+    def fail_intent(*_args, **_kwargs):
+        raise sqlite3.OperationalError("synthetic intent storage failure")
+
+    monkeypatch.setattr(db, "claim_delivery", fail_intent)
+    mailer = FakeMailer()
+    stats = await run_tick(settings=settings, feeds_file=feeds_file, db=db, mailer=mailer)
+    assert stats["failed"] == 1 and stats["emailed"] == 0
+    assert mailer.sent == []
+    ep = db.get_episode(FEED_URL, NEWEST_GUID)
+    assert ep.status == "summarized" and ep.emailed_at is None
+    assert db.get_delivery(FEED_URL, NEWEST_GUID) is None
+    assert Path(ep.audio_path).exists()
+
+
+async def test_crash_after_intent_before_send_restarts_held(
+    settings, db, feeds_file, mock_llm, mock_transcribe, mock_http, monkeypatch, caplog,
+):
+    from podcast_digest.db import Database
+
+    original = db.claim_delivery
+
+    def commit_then_crash(*args, **kwargs):
+        original(*args, **kwargs)
+        raise _DeliveryCrash()
+
+    monkeypatch.setattr(db, "claim_delivery", commit_then_crash)
+    first = FakeMailer()
+    with pytest.raises(_DeliveryCrash):
+        await run_tick(settings=settings, feeds_file=feeds_file, db=db, mailer=first)
+    row = db.get_delivery(FEED_URL, NEWEST_GUID)
+    assert row.state == "unknown" and row.receipt is None and first.sent == []
+    db.close()
+    restarted = Database(settings.db_path)
+    try:
+        good = FakeMailer()
+        stats = await run_tick(settings=settings, feeds_file=feeds_file,
+                               db=restarted, mailer=good)
+        assert stats["emailed"] == 0 and good.sent == []
+        ep = restarted.get_episode(FEED_URL, NEWEST_GUID)
+        assert (ep.status, ep.emailed_at, ep.attempts) == ("summarized", None, 0)
+        assert Path(ep.audio_path).exists()
+        assert f"delivery inspect {row.operation_id}" in caplog.text
+    finally:
+        restarted.close()
+
+
+@pytest.mark.parametrize("failure", ["crash", "sqlite"])
+async def test_acceptance_before_final_record_never_resends_after_restart(
+    settings, db, feeds_file, mock_llm, mock_transcribe, mock_http, monkeypatch, failure,
+):
+    import sqlite3
+
+    from podcast_digest.db import Database
+    from podcast_digest.delivery import reconcile_sent_item
+    from podcast_digest.mail import GraphMailer
+
+    graph = GraphMailer(tenant_id="test", client_id="test", client_secret="test",
+                        sender="bot@example.com")
+    first = FakeMailer()
+    first.delivery_target = graph.delivery_target
+
+    def fail_final_record(*_args, **_kwargs):
+        if failure == "crash":
+            raise _DeliveryCrash()
+        raise sqlite3.OperationalError("synthetic final storage failure")
+
+    monkeypatch.setattr(db, "complete_delivery", fail_final_record)
+    if failure == "crash":
+        with pytest.raises(_DeliveryCrash):
+            await run_tick(settings=settings, feeds_file=feeds_file, db=db, mailer=first)
+    else:
+        stats = await run_tick(settings=settings, feeds_file=feeds_file, db=db, mailer=first)
+        assert stats["emailed"] == 0 and stats["failed"] == 1
+    assert len(first.sent) == 1
+    row = db.get_delivery(FEED_URL, NEWEST_GUID)
+    assert row.state == "unknown" and row.receipt is None
+    db.close()
+    restarted = Database(settings.db_path)
+    try:
+        good = FakeMailer()
+        good.delivery_target = graph.delivery_target
+        await run_tick(settings=settings, feeds_file=feeds_file, db=restarted, mailer=good)
+        assert good.sent == []
+        ep = restarted.get_episode(FEED_URL, NEWEST_GUID)
+        assert ep.status == "summarized" and ep.emailed_at is None and ep.attempts == 0
+        assert Path(ep.audio_path).exists()
+        # Missing observation cannot complete the held intent; a later positive
+        # provider observation can. Neither path submits another message.
+        monkeypatch.setattr(graph, "sent_receipt", lambda **_kwargs: None)
+        assert reconcile_sent_item(restarted, graph, row, "missing") is False
+        assert restarted.get_episode(FEED_URL, NEWEST_GUID).status == "summarized"
+        monkeypatch.setattr(graph, "sent_receipt", lambda **_kwargs: "graph-sent-item:synthetic")
+        assert reconcile_sent_item(restarted, graph, row, "synthetic") is True
+        assert restarted.get_episode(FEED_URL, NEWEST_GUID).status == "emailed"
+        await run_tick(settings=settings, feeds_file=feeds_file, db=restarted, mailer=good)
+        assert good.sent == []
+    finally:
+        restarted.close()
+
+
+@pytest.mark.parametrize("attach_mode", ["raw", "cleaned"])
+@pytest.mark.parametrize("legacy_fingerprint", [False, True])
+async def test_summarized_missing_transcripts_keeps_stage_and_failure_budget(
+    settings, db, feeds_file, mock_llm, mock_transcribe, mock_http, attach_mode, legacy_fingerprint,
+):
+    from podcast_digest.mail import MailOutcomeUnknown
+
+    settings.PODCAST_DIGEST_ATTACH_TRANSCRIPT = attach_mode
+    await run_tick(settings=settings, feeds_file=feeds_file, db=db, mailer=None, dry_run=True)
+    before = db.get_episode(FEED_URL, NEWEST_GUID)
+    assert before.status == "summarized"
+    if legacy_fingerprint:
+        db._conn.execute(
+            "UPDATE episodes SET content_sha256=NULL, content_minhash=NULL, "
+            "content_token_count=NULL WHERE feed_url=? AND guid=?", (FEED_URL, NEWEST_GUID),
+        )
+    for path in settings.transcripts_dir.rglob("*"):
+        if path.is_file():
+            path.unlink()
+    db.mark_failed(FEED_URL, NEWEST_GUID, "synthetic prior failure")
+    calls = len(mock_transcribe.calls), len(mock_llm.calls)
+    ambiguous = FakeMailer(fail=True, exc=MailOutcomeUnknown("lost verdict"))
+    await run_tick(settings=settings, feeds_file=feeds_file, db=db, mailer=ambiguous)
+    after = db.get_episode(FEED_URL, NEWEST_GUID)
+    assert (after.status, after.summary_html, after.attempts) == ("summarized", before.summary_html, 1)
+    assert (len(mock_transcribe.calls), len(mock_llm.calls)) == calls
+    assert after.emailed_at is None
+    assert Path(after.audio_path).exists()
+    assert db.get_delivery(FEED_URL, NEWEST_GUID).state == "unknown"
+
+
+async def test_safe_retry_uses_frozen_attachment_after_files_and_recipient_change(
+    settings, db, feeds_file, mock_llm, mock_transcribe, mock_http,
+):
+    from podcast_digest.delivery import Envelope
+
+    settings.PODCAST_DIGEST_ATTACH_TRANSCRIPT = "raw"
+    await run_tick(settings=settings, feeds_file=feeds_file, db=db, mailer=FakeMailer(fail=True))
+    saved = db.get_delivery(FEED_URL, NEWEST_GUID)
+    original = Envelope.parse(saved.envelope)
+    assert len(original.attachments) == 1
+    for path in settings.transcripts_dir.rglob("*"):
+        if path.is_file():
+            path.unlink()
+    feeds_file.recipient = "changed@example.com"
+    good = FakeMailer()
+    await run_tick(settings=settings, feeds_file=feeds_file, db=db, mailer=good)
+    [sent] = good.sent
+    assert sent["to"] == original.to and sent["to"] != feeds_file.recipient
+    assert sent["body_html"] == original.body_html
+    assert sent["attachments"] == list(original.attachments)
+    assert sent["operation_id"] == saved.operation_id
+    assert db.get_episode(FEED_URL, NEWEST_GUID).status == "emailed"
+    assert len(mock_transcribe.calls) == 1 and len(mock_llm.calls) == 1
+
+
+async def test_competing_tick_cannot_submit_same_pending_digest(
+    settings, db, feeds_file, mock_llm, mock_transcribe, mock_http,
+):
+    import asyncio
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockedMailer(FakeMailer):
+        def send(self, **kwargs):
+            entered.set()
+            assert release.wait(timeout=10)
+            super().send(**kwargs)
+
+    first = BlockedMailer()
+    task = asyncio.create_task(run_tick(settings=settings, feeds_file=feeds_file, db=db, mailer=first))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        other = FakeMailer()
+        skipped = await run_tick(settings=settings, feeds_file=feeds_file, db=db, mailer=other)
+        assert skipped["skipped"] is True and other.sent == []
+    finally:
+        release.set()
+        await task
+    assert len(first.sent) == 1
+    assert db.get_episode(FEED_URL, NEWEST_GUID).status == "emailed"

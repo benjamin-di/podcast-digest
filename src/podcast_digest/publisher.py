@@ -385,10 +385,11 @@ def to_markdown(pub: PublisherTranscript, *, title: str, show: str) -> str:
 
 
 def source_of(segments_json_path) -> str:
-    """"publisher" or "whisper", from a transcript JSON artifact."""
+    """Identify the producer of a transcript JSON artifact."""
     try:
         data = json.loads(segments_json_path.read_text(encoding="utf-8"))
     except (OSError, ValueError, AttributeError):
         return "whisper"
     source = data.get("source") if isinstance(data, dict) else None
-    return "publisher" if isinstance(source, dict) and source.get("kind") == "publisher" else "whisper"
+    kind = source.get("kind") if isinstance(source, dict) else None
+    return kind if kind in ("publisher", "parakeet", "qwen") else "whisper"

@@ -15,7 +15,7 @@ import httpx
 from . import youtube
 from .curlfetch import fetch_to_file
 from .feeds import USER_AGENT
-from .net import validate_async_request, validate_outbound_url_async
+from .net import build_async_client, validate_outbound_url_async
 from .proc import SubprocessTimeout, run_capture
 
 logger = logging.getLogger(__name__)
@@ -65,9 +65,8 @@ async def download(
     # Streaming requires its own client w/ follow_redirects because podcast
     # CDNs (libsyn, megaphone, acast) chain 2-3 redirects to land on the MP3.
     owns_client = client is None
-    active_client = client or httpx.AsyncClient(
+    active_client = client or build_async_client(
         timeout=DOWNLOAD_TIMEOUT, follow_redirects=True,
-        event_hooks={"request": [validate_async_request]},
     )
 
     try:

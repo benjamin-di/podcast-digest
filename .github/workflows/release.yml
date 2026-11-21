@@ -78,6 +78,8 @@ jobs:
             test "${GITHUB_REF_NAME#v}" = "$version"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          transcriber_version="$(python3 -c 'import tomllib; print(tomllib.load(open("packages/local-transcriber/pyproject.toml", "rb"))["project"]["version"])')"
+          echo "transcriber_version=$transcriber_version" >> "$GITHUB_OUTPUT"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -99,15 +101,18 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.source.outputs.version }}
             org.opencontainers.image.licenses=MIT
             org.opencontainers.image.description=whisper.cpp (OpenVINO) local transcriber used by podcast-digest
-          build-args: SOURCE_REVISION=${{ github.sha }}
+          build-args: |
+            VERSION=${{ steps.source.outputs.transcriber_version }}
+            VCS_REF=${{ github.sha }}
           cache-from: type=registry,ref=${{ env.TRANSCRIBER_IMAGE }}:buildcache
           cache-to: type=registry,mode=max,ref=${{ env.TRANSCRIBER_IMAGE }}:buildcache
           provenance: mode=max
           sbom: true
       - name: Smoke transcriber digest
-        run: bash scripts/smoke-image.sh transcriber "$TRANSCRIBER_IMAGE@${{ steps.transcriber.outputs.digest }}" "${{ github.sha }}" "${{ steps.source.outputs.version }}"
+        run: bash scripts/smoke-image.sh transcriber "$TRANSCRIBER_IMAGE@${{ steps.transcriber.outputs.digest }}" "${{ github.sha }}" "${{ steps.source.outputs.version }}" "${{ steps.source.outputs.transcriber_version }}"
 
       - name: Build engine from the transcriber digest
         id: engine
@@ -122,15 +127,19 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.source.outputs.version }}
             org.opencontainers.image.licenses=MIT
             org.opencontainers.image.description=podcast-digest: transcribe new podcast episodes and email a summary
-          build-args: TRANSCRIBER_IMAGE=${{ env.TRANSCRIBER_IMAGE }}@${{ steps.transcriber.outputs.digest }}
+          build-args: |
+            VERSION=${{ steps.source.outputs.version }}
+            VCS_REF=${{ github.sha }}
+            TRANSCRIBER_IMAGE=${{ env.TRANSCRIBER_IMAGE }}@${{ steps.transcriber.outputs.digest }}
           cache-from: type=registry,ref=${{ env.ENGINE_IMAGE }}:buildcache
           cache-to: type=registry,mode=max,ref=${{ env.ENGINE_IMAGE }}:buildcache
           provenance: mode=max
           sbom: true
       - name: Smoke engine digest
-        run: bash scripts/smoke-image.sh podcast "$ENGINE_IMAGE@${{ steps.engine.outputs.digest }}" "${{ github.sha }}" "${{ steps.source.outputs.version }}"
+        run: bash scripts/smoke-image.sh podcast "$ENGINE_IMAGE@${{ steps.engine.outputs.digest }}" "${{ github.sha }}" "${{ steps.source.outputs.version }}" "${{ steps.source.outputs.transcriber_version }}"
 
       - name: Build MCP candidate (amd64 + arm64)
         id: mcp
@@ -145,14 +154,19 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.source.outputs.version }}
             org.opencontainers.image.licenses=MIT
             org.opencontainers.image.description=podcast-digest MCP server: manage subscriptions from Claude
+          build-args: |
+            VERSION=${{ steps.source.outputs.version }}
+            TRANSCRIBER_VERSION=${{ steps.source.outputs.transcriber_version }}
+            VCS_REF=${{ github.sha }}
           cache-from: type=registry,ref=${{ env.MCP_IMAGE }}:buildcache
           cache-to: type=registry,mode=max,ref=${{ env.MCP_IMAGE }}:buildcache
           provenance: mode=max
           sbom: true
       - name: Smoke MCP digest
-        run: bash scripts/smoke-image.sh mcp "$MCP_IMAGE@${{ steps.mcp.outputs.digest }}" "${{ github.sha }}" "${{ steps.source.outputs.version }}"
+        run: bash scripts/smoke-image.sh mcp "$MCP_IMAGE@${{ steps.mcp.outputs.digest }}" "${{ github.sha }}" "${{ steps.source.outputs.version }}" "${{ steps.source.outputs.transcriber_version }}"
 
       - name: Record tested digests
         run: |
@@ -190,4 +204,9 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --generate-notes
+        run: |
+          # The notes are the annotated tag's message: the version's CHANGELOG.md entry (publish-public).
+          object=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq 'select(.object.type == "tag") | .object.sha')
+          test -n "$object" || { echo "::error::$TAG is not an annotated tag carrying release notes"; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/git/tags/$object" --jq .message > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"

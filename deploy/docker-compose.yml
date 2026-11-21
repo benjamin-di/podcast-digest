@@ -2,6 +2,7 @@
 #
 #   mkdir -p config && cp feeds.toml config/feeds.toml   # then edit it
 #   cp example.env .env                                  # then fill it in
+#   # Export VERSION, TRANSCRIBER_VERSION and VCS_REF as shown in README.md.
 #   docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
 #   docker compose --env-file .env -f deploy/docker-compose.yml --profile mcp up -d --build
 #
@@ -14,6 +15,10 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      args:
+        VERSION: ${VERSION:?Set VERSION from pyproject.toml}
+        TRANSCRIBER_VERSION: ${TRANSCRIBER_VERSION:?Set TRANSCRIBER_VERSION from packages/local-transcriber/pyproject.toml}
+        VCS_REF: ${VCS_REF:?Set VCS_REF to the full source revision}
       target: podcast-runtime
     image: podcast-digest:local
     container_name: podcast-digest
@@ -49,6 +54,10 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.mcp
+      args:
+        VERSION: ${VERSION:?Set VERSION from pyproject.toml}
+        TRANSCRIBER_VERSION: ${TRANSCRIBER_VERSION:?Set TRANSCRIBER_VERSION from packages/local-transcriber/pyproject.toml}
+        VCS_REF: ${VCS_REF:?Set VCS_REF to the full source revision}
     image: podcast-digest-mcp:local
     container_name: podcast-digest-mcp
     restart: unless-stopped
@@ -60,8 +69,10 @@ services:
       # refuses to start without one.
       PODCAST_MCP_BEARER_TOKEN: ${PODCAST_MCP_BEARER_TOKEN:-}
       PODCAST_DIGEST_CONFIG: /config/feeds.toml
+      PODCAST_DIGEST_DATA_DIR: /data
     volumes:
       - ../config:/config
+      - podcast-digest-data:/data:ro
     ports:
       - "127.0.0.1:8000:8000"
     security_opt:

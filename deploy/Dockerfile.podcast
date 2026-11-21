@@ -7,11 +7,16 @@ FROM ${TRANSCRIBER_IMAGE} AS podcast-runtime
 
 USER root
 WORKDIR /app
-COPY pyproject.toml README.md /app/
+COPY pyproject.toml README.md hatch_build.py /app/
 COPY src /app/src
-RUN /opt/venv/bin/pip install -e .
+COPY scripts/embed-build-identity.py /app/scripts/embed-build-identity.py
+ARG VERSION
+ARG VCS_REF
+RUN python scripts/embed-build-identity.py podcast-digest "$VERSION" "$VCS_REF" \
+ && /opt/venv/bin/pip install '.[parakeet]'
 
 COPY feeds.toml /app/feeds.toml
+COPY --chmod=0755 deploy/podcast-entrypoint.sh deploy/prepare-onnx-model.sh /usr/local/bin/
 
 ENV WHISPER_MODEL_DIR=/data/models \
     PODCAST_DIGEST_DATA_DIR=/data \
@@ -23,4 +28,5 @@ ENV WHISPER_MODEL_DIR=/data/models \
 HEALTHCHECK --interval=5m --timeout=10s --start-period=10m --start-interval=2s --retries=3 \
     CMD pgrep -f "podcast_digest.*serve|podcast-digest serve" >/dev/null || exit 1
 
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/podcast-entrypoint.sh"]
 CMD ["podcast-digest", "serve"]

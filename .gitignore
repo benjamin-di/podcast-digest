@@ -18,3 +18,9 @@ data/
 
 # Quickstart config (deploy/docker-compose.yml)
 config/
+
+# Disposable native check diagnostics
+.artifacts/
+
+# Generated only from validated packaging inputs.
+**/build_identity.json

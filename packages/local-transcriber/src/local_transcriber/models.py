@@ -5,6 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+PARAKEET_MODEL_NAME = "parakeet-unified-en-0.6b-int8"
+PARAKEET_MODEL_FILES = ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt")
+QWEN_MODEL_NAME = "qwen3-asr-0.6b-int8"
+QWEN_MODEL_FILES = (
+    "conv_frontend.onnx", "encoder.int8.onnx", "decoder.int8.onnx", "tokenizer/merges.txt",
+    "tokenizer/tokenizer_config.json", "tokenizer/vocab.json",
+)
+
 
 @dataclass(frozen=True)
 class Segment:
@@ -36,6 +44,19 @@ class WhisperCppConfig:
     whisper_seconds_per_audio_second: float = 4.0
     lock_path: Path | None = None
     lock_timeout_s: float = 21_600.0
+
+
+@dataclass(frozen=True)
+class ParakeetConfig:
+    model_dir: Path
+    threads: int = 4
+    worker_ssh_config: Path | None = None
+
+
+@dataclass(frozen=True)
+class QwenConfig:
+    model_dir: Path
+    threads: int = 4
 
 
 @dataclass(frozen=True)

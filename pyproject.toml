@@ -1,6 +1,6 @@
 [project]
 name = "podcast-digest"
-version = "0.4.6"
+version = "1.4.2"
 description = "Follow podcasts and YouTube, transcribe locally with whisper.cpp, email an LLM-written summary of every new episode."
 readme = "README.md"
 license = "MIT"
@@ -64,6 +64,7 @@ podcast-digest = "podcast_digest.__main__:main"
 podcast-digest-mcp = "podcast_digest_mcp.__main__:main"
 
 [project.optional-dependencies]
+parakeet = ["numpy==2.4.4", "sherpa-onnx==2.0.1"]
 test = [
     "mypy>=2.3",
     "pytest>=8",
@@ -94,3 +95,6 @@ ignore = [
 [tool.mypy]
 python_version = "3.12"
 ignore_missing_imports = true
+
+[tool.hatch.build.hooks.custom]
+stamps = { podcast-digest = "src/podcast_digest/build_identity.json", podcast-digest-mcp = "src/podcast_digest_mcp/build_identity.json" }

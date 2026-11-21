@@ -4,8 +4,19 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"
 
-uv sync --all-extras --frozen
-uv run ruff check src tests packages/local-transcriber/src packages/local-transcriber/tests
-uv run mypy src packages/local-transcriber/src
-uv run pytest --tb=short
-uv run podcast-digest check-config feeds.toml
+# Named phases share exactly the same commands as the complete local gate.
+dependencies() { uv sync --all-extras --frozen; }
+lint() { uv run ruff check src tests packages/local-transcriber/src packages/local-transcriber/tests; }
+types() { uv run mypy src packages/local-transcriber/src; }
+tests() { uv run pytest --tb=short --durations=30; }
+config() { uv run podcast-digest check-config feeds.toml; }
+
+if (( $# > 1 )); then
+  echo 'usage: scripts/check [dependencies|lint|types|tests|config]' >&2
+  exit 2
+fi
+case "${1:-all}" in
+  all) dependencies; lint; types; tests; config ;;
+  dependencies|lint|types|tests|config) "$1" ;;
+  *) echo "Unknown check phase: $1" >&2; exit 2 ;;
+esac

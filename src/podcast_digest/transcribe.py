@@ -1,4 +1,4 @@
-"""Podcast adapter over the reusable local whisper.cpp transcriber."""
+"""Podcast adapter over the reusable local transcriber."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 
 from local_transcriber import (
+    ParakeetConfig,
+    QwenConfig,
     Segment,
     Transcript,
     TranscriptionError,
@@ -34,12 +36,20 @@ async def transcribe(
     model_path: Path,
     language: str = "en",
     threads: int = 8,
+    parakeet_model_dir: Path | None = None,
+    parakeet_worker_ssh_config: Path | None = None,
+    parakeet_threads: int = 4,
+    qwen_model_dir: Path | None = None,
+    qwen_threads: int = 4,
 ) -> tuple[Transcript, Path, Path]:
     """Transcribe an episode and return the podcast pipeline's legacy tuple."""
     result = await transcribe_file(
         audio_path,
         output_dir=out_dir,
         artifact_id=basename,
+        parakeet=(ParakeetConfig(parakeet_model_dir, parakeet_threads, parakeet_worker_ssh_config)
+                  if parakeet_model_dir is not None else None),
+        qwen=QwenConfig(qwen_model_dir, qwen_threads) if qwen_model_dir is not None else None,
         config=WhisperCppConfig(
             whisper_bin=whisper_bin,
             model_path=model_path,

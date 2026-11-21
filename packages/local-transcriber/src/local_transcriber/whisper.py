@@ -1,4 +1,4 @@
-"""Atomic whisper.cpp transcription of a local media file."""
+"""Atomic transcription of a local media file."""
 
 from __future__ import annotations
 
@@ -12,15 +12,35 @@ import logging
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 from dataclasses import asdict
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-from .models import Segment, Transcript, TranscriptionResult, WhisperCppConfig
+from .identity import BUILD
+from .models import (
+    PARAKEET_MODEL_FILES,
+    PARAKEET_MODEL_NAME,
+    QWEN_MODEL_FILES,
+    QWEN_MODEL_NAME,
+    ParakeetConfig,
+    QwenConfig,
+    Segment,
+    Transcript,
+    TranscriptionResult,
+    WhisperCppConfig,
+)
 from .proc import SubprocessTimeout, run_capture
+from .remote import RemoteConfig, WorkerError, run_remote_parakeet
 
 logger = logging.getLogger(__name__)
+
+_SHERPA_MODELS = {
+    "parakeet": (PARAKEET_MODEL_NAME, PARAKEET_MODEL_FILES),
+    "qwen": (QWEN_MODEL_NAME, QWEN_MODEL_FILES),
+}
 
 _WAV_BYTES_PER_SECOND = 32_000
 _ARTIFACT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
@@ -128,6 +148,8 @@ async def transcribe_file(
     artifact_id: str,
     config: WhisperCppConfig,
     work_root: Path | None = None,
+    parakeet: ParakeetConfig | None = None,
+    qwen: QwenConfig | None = None,
 ) -> TranscriptionResult:
     """Transcribe a local media file and publish validated artifacts atomically.
 
@@ -140,12 +162,17 @@ async def transcribe_file(
     output_dir = Path(output_dir)
     if not input_path.is_file():
         raise TranscriptionError(f"media not found: {input_path}")
-    if not config.model_path.is_file():
-        raise TranscriptionError(f"whisper model not found: {config.model_path}")
+    local_engine, local_config = {
+        "en": ("parakeet", parakeet),
+        "zh": ("qwen", qwen),
+        "yue": ("qwen", qwen),
+    }.get(config.language, ("", None))
+    if config.initial_prompt:
+        local_config = None
+    if local_config is None:
+        _validate_whisper(config)
     if not shutil.which(config.ffmpeg_bin):
         raise TranscriptionError(f"ffmpeg binary not found: {config.ffmpeg_bin}")
-    if not shutil.which(config.whisper_bin) and not Path(config.whisper_bin).is_file():
-        raise TranscriptionError(f"whisper binary not found: {config.whisper_bin}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     root = Path(work_root) if work_root else output_dir.parent / "tmp"
@@ -157,11 +184,46 @@ async def transcribe_file(
     try:
         await _normalize(input_path, wav_path, config=config)
         duration_seconds = max(0.0, (wav_path.stat().st_size - 44) / _WAV_BYTES_PER_SECOND)
-        async with _device_lock(config):
-            await _run_whisper(wav_path, output_base=output_base, config=config)
         staged_json = output_base.with_suffix(".json")
         staged_txt = output_base.with_suffix(".txt")
-        transcript = load_whisper_json(staged_json, fallback_text_path=staged_txt)
+        engine, engine_version = "whisper.cpp", config.engine_version
+        model_name, threads, device = config.model_path.name, config.threads, config.device
+        transcript: Transcript | None = None
+        remote_revision = None
+        if isinstance(local_config, ParakeetConfig) and local_config.worker_ssh_config:
+            try:
+                worker = await run_remote_parakeet(
+                    wav_path, staged_json,
+                    config=RemoteConfig(("ssh", "-T", "-oBatchMode=yes", "-oStrictHostKeyChecking=yes",
+                                         "-F", str(local_config.worker_ssh_config), "parakeet-worker")),
+                )
+                transcript = load_whisper_json(staged_json, strict_parakeet=True)
+            except (WorkerError, TranscriptionError, OSError, ValueError, TypeError, RecursionError, OverflowError) as exc:
+                logger.warning("transcribe.parakeet_worker_fallback reason=%s", str(exc) if isinstance(exc, WorkerError) else type(exc).__name__)
+                staged_json.unlink(missing_ok=True)
+            else:
+                engine, engine_version = "parakeet", worker.engine_version
+                model_sha256, remote_revision = worker.model_sha256, worker.source_revision
+                model_name, threads, device = PARAKEET_MODEL_NAME, worker.threads, "CPU"
+                logger.info("transcribe.parakeet_worker_complete threads=%d", threads)
+        if transcript is None and local_config is not None:
+            try:
+                version_used, model_sha256 = await _run_sherpa(wav_path, staged_json, local_engine, local_config)
+                transcript = load_whisper_json(staged_json)
+            except (TranscriptionError, OSError) as exc:
+                logger.warning("transcribe.%s_fallback reason=%s", local_engine, exc)
+                staged_json.unlink(missing_ok=True)
+            else:
+                engine, engine_version = local_engine, version_used
+                model_name, threads, device = _SHERPA_MODELS[local_engine][0], local_config.threads, "CPU"
+                logger.info("transcribe.%s_complete threads=%d", local_engine, threads)
+        if transcript is None:
+            if local_config is not None:
+                _validate_whisper(config)
+            async with _device_lock(config):
+                await _run_whisper(wav_path, output_base=output_base, config=config)
+            transcript = load_whisper_json(staged_json, fallback_text_path=staged_txt)
+            model_sha256 = _hash_file(config.model_path)
         if not staged_txt.exists():
             staged_txt.write_text(transcript.text, encoding="utf-8")
 
@@ -172,23 +234,22 @@ async def transcribe_file(
         _atomic_publish(staged_json, json_path)
 
         input_sha256 = _hash_file(input_path)
-        model_sha256 = _hash_file(config.model_path)
-        source_revision = os.environ.get("LOCAL_TRANSCRIBER_SOURCE_REV") or None
+        source_revision = BUILD.source_revision
         manifest = {
             "schema_version": 2,
             "artifact_id": artifact_id,
             "input_sha256": input_sha256,
             "duration_seconds": round(duration_seconds, 3),
             "language": config.language,
-            "engine": "whisper.cpp",
-            "engine_version": config.engine_version,
-            "model_name": config.model_path.name,
+            "engine": engine,
+            "engine_version": engine_version,
+            "model_name": model_name,
             "model_sha256": model_sha256,
             "local_transcriber_source_revision": source_revision,
-            "whisper_binary": config.whisper_bin,
+            "whisper_binary": config.whisper_bin if engine == "whisper.cpp" else None,
             "ffmpeg_binary": config.ffmpeg_bin,
-            "threads": config.threads,
-            "device": config.device,
+            "threads": threads,
+            "device": device,
             "initial_prompt": config.initial_prompt,
             "initial_prompt_sha256": _prompt_sha256(config.initial_prompt),
             "segments": [asdict(segment) for segment in transcript.segments],
@@ -196,6 +257,8 @@ async def transcribe_file(
             "json_file": json_path.name,
             "elapsed_seconds": round(time.perf_counter() - started, 3),
         }
+        if remote_revision is not None:
+            manifest["worker_source_revision"] = remote_revision
         staged_manifest = work_dir / "manifest.json"
         staged_manifest.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -208,15 +271,50 @@ async def transcribe_file(
             manifest_path=manifest_path,
             input_sha256=input_sha256,
             duration_seconds=duration_seconds,
-            engine="whisper.cpp",
-            engine_version=config.engine_version,
-            model_name=config.model_path.name,
+            engine=engine,
+            engine_version=engine_version,
+            model_name=model_name,
             language=config.language,
             model_sha256=model_sha256,
             source_revision=source_revision,
         )
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _validate_whisper(config: WhisperCppConfig) -> None:
+    if not config.model_path.is_file():
+        raise TranscriptionError(f"whisper model not found: {config.model_path}")
+    if not shutil.which(config.whisper_bin) and not Path(config.whisper_bin).is_file():
+        raise TranscriptionError(f"whisper binary not found: {config.whisper_bin}")
+
+
+async def _run_sherpa(
+    wav_path: Path, output_path: Path, engine: str, config: ParakeetConfig | QwenConfig,
+) -> tuple[str, str]:
+    try:
+        engine_version = version("sherpa-onnx")
+    except PackageNotFoundError:
+        raise TranscriptionError("sherpa-onnx is unavailable") from None
+    model_files = _SHERPA_MODELS[engine][1]
+    if any(not (config.model_dir / name).is_file() for name in model_files):
+        raise TranscriptionError(f"{engine} model files are unavailable")
+    cmd = [sys.executable, "-m", f"local_transcriber.{engine}", str(wav_path),
+           str(config.model_dir), str(output_path), str(config.threads)]
+    audio_seconds = wav_path.stat().st_size / _WAV_BYTES_PER_SECOND
+    try:
+        rc, _, _ = await run_capture(
+            cmd, timeout=max(120.0, 2.0 * audio_seconds), label=engine,
+            env=dict(os.environ, OPENBLAS_NUM_THREADS="1"),
+        )
+    except SubprocessTimeout as exc:
+        raise TranscriptionError(str(exc)) from exc
+    if rc:
+        raise TranscriptionError(f"{engine} inference failed (rc={rc})")
+    digests = await asyncio.to_thread(
+        lambda: b"".join(bytes.fromhex(_hash_file(config.model_dir / name)) for name in model_files)
+    )
+    return engine_version, hashlib.sha256(digests).hexdigest()
 
 
 async def _normalize(src: Path, dst: Path, *, config: WhisperCppConfig) -> None:
@@ -292,7 +390,7 @@ async def _run_whisper(
 
 
 def load_whisper_json(
-    json_path: Path, *, fallback_text_path: Path | None = None
+    json_path: Path, *, fallback_text_path: Path | None = None, strict_parakeet: bool = False
 ) -> Transcript:
     if not json_path.exists():
         raise TranscriptionError(f"whisper JSON output missing: {json_path}")
@@ -302,6 +400,21 @@ def load_whisper_json(
         raise TranscriptionError(f"invalid whisper JSON output: {json_path}: {exc}") from exc
     if not isinstance(data, dict):
         raise TranscriptionError(f"invalid whisper JSON root (expected object): {json_path}")
+
+    if strict_parakeet:
+        rows = data.get("transcription")
+        if data.get("source") != {"kind": "parakeet"} or not isinstance(rows, list) or not rows:
+            raise TranscriptionError("invalid Parakeet transcript")
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("text"), str) or not row["text"].strip():
+                raise TranscriptionError("invalid Parakeet segment text")
+            row["text"].encode("utf-8")  # Reject unpaired surrogates before accepting the reply.
+            offsets = row.get("offsets")
+            if not isinstance(offsets, dict):
+                raise TranscriptionError("missing Parakeet offsets")
+            start_ms, end_ms = offsets.get("from"), offsets.get("to")
+            if type(start_ms) is not int or type(end_ms) is not int or not 0 <= start_ms <= end_ms <= 86_400_000:
+                raise TranscriptionError("invalid Parakeet segment offsets")
 
     segments: list[Segment] = []
     for raw in data.get("transcription") or []:

@@ -17,6 +17,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -68,8 +69,8 @@ class Feed(BaseModel):
     # direct-audio sources, which carry no duration at ingest).
     min_minutes: int | None = Field(default=None, ge=0)
     # Spoken language of the episodes as an ISO 639-1 code ("zh" for Mandarin;
-    # "ja", "de", … also work). Unset or "en" = the English path, byte-for-byte
-    # unchanged (.en whisper model). Any other value switches transcription to
+    # "ja", "de", … also work). Unset or "en" selects the deployment's English
+    # path. Any other value switches transcription to
     # the multilingual whisper model (PODCAST_DIGEST_WHISPER_MODEL_MULTILINGUAL)
     # with `-l <code>`, and the summarizer still emits English — it reads the
     # original-language transcript directly (no translation step). The episode
@@ -84,6 +85,10 @@ class Feed(BaseModel):
     # usable. Set `publisher_transcripts = false` for a feed whose transcripts
     # are poor; PODCAST_DIGEST_PUBLISHER_TRANSCRIPTS switches it off globally.
     publisher_transcripts: bool = True
+    # Maximum unseen episodes to process per steady-state tick for this feed.
+    # `None` inherits FeedsFile.max_new_per_tick (default 1). First sight of a
+    # feed still caps at 1 to prevent back-catalog floods.
+    max_new_per_tick: int | None = Field(default=None, ge=1)
 
     @field_validator(
         "rss_url", "search", "youtube", "youtube_video", "audio_url",
@@ -164,6 +169,8 @@ class FeedsFile(BaseModel):
     # set its own `min_minutes`. A per-feed value (including an explicit 0)
     # overrides this. Default 0 = no floor unless configured.
     min_minutes: int = Field(default=0, ge=0)
+    # Default cap on unseen episodes processed per feed per steady-state tick.
+    max_new_per_tick: int = Field(default=1, ge=1)
     feeds: list[Feed] = Field(default_factory=list)
 
     @field_validator("recipient")
@@ -177,6 +184,10 @@ class FeedsFile(BaseModel):
     def min_minutes_for(self, feed: Feed) -> int:
         """Effective length floor for a feed: its own value, else the file default."""
         return feed.min_minutes if feed.min_minutes is not None else self.min_minutes
+
+    def max_new_per_tick_for(self, feed: Feed) -> int:
+        """Effective per-tick new-episode cap for a feed."""
+        return feed.max_new_per_tick if feed.max_new_per_tick is not None else self.max_new_per_tick
 
 
 class Settings(BaseSettings):
@@ -206,7 +217,9 @@ class Settings(BaseSettings):
     # set, requests go to that OpenAI-compatible server (Chat Completions) and
     # OPENAI_API_KEY is optional.
     ANTHROPIC_API_KEY: str = ""
+    ANTHROPIC_API_KEY_FILE: Path | None = None
     OPENAI_API_KEY: str = ""
+    OPENAI_API_KEY_FILE: Path | None = None
     PODCAST_DIGEST_MODEL: str = "claude-opus-5-5"
     PODCAST_DIGEST_PROVIDER: Literal["auto", "anthropic", "openai"] = "auto"
     PODCAST_DIGEST_OPENAI_BASE_URL: str = ""
@@ -255,12 +268,14 @@ class Settings(BaseSettings):
     PODCAST_DIGEST_SMTP_PORT: int = Field(default=587, ge=1, le=65535)
     PODCAST_DIGEST_SMTP_USERNAME: str = ""
     PODCAST_DIGEST_SMTP_PASSWORD: str = ""
+    PODCAST_DIGEST_SMTP_PASSWORD_FILE: Path | None = None
     # "starttls" (port 587), "ssl" (implicit TLS, port 465), or "none" (a local
     # relay only — credentials would travel in clear text).
     PODCAST_DIGEST_SMTP_SECURITY: Literal["starttls", "ssl", "none"] = "starttls"
     PODCAST_DIGEST_GRAPH_TENANT_ID: str = ""
     PODCAST_DIGEST_GRAPH_CLIENT_ID: str = ""
     PODCAST_DIGEST_GRAPH_CLIENT_SECRET: str = ""
+    PODCAST_DIGEST_GRAPH_CLIENT_SECRET_FILE: Path | None = None
 
     # --- Paths ------------------------------------------------------------
     PODCAST_DIGEST_DATA_DIR: Path = Path("/data")
@@ -279,6 +294,11 @@ class Settings(BaseSettings):
     )
     PODCAST_DIGEST_WHISPER_THREADS: int = Field(default=8, gt=0)
     PODCAST_DIGEST_WHISPER_LANGUAGE: str = "en"
+    PODCAST_DIGEST_PARAKEET_WORKER_SSH_CONFIG: Path | None = None
+    PODCAST_DIGEST_PARAKEET_MODEL_DIR: Path | None = None
+    PODCAST_DIGEST_PARAKEET_THREADS: int = Field(default=4, gt=0, le=32)
+    PODCAST_DIGEST_QWEN_MODEL_DIR: Path | None = None
+    PODCAST_DIGEST_QWEN_THREADS: int = Field(default=4, gt=0, le=32)
     # Prefer a transcript the publisher links in the feed (Podcasting 2.0) over
     # downloading and transcribing the audio. See publisher.py.
     PODCAST_DIGEST_PUBLISHER_TRANSCRIPTS: bool = True
@@ -308,6 +328,7 @@ class Settings(BaseSettings):
     # See docs/webhook.md for the payload and retry contract.
     PODCAST_DIGEST_WEBHOOK_URL: str = ""
     PODCAST_DIGEST_WEBHOOK_TOKEN: str = ""
+    PODCAST_DIGEST_WEBHOOK_TOKEN_FILE: Path | None = None
     PODCAST_DIGEST_WEBHOOK_TIMEOUT: int = Field(default=30, gt=0)
     PODCAST_DIGEST_WEBHOOK_FIELDS: dict[str, Any] = Field(default_factory=dict)
     PODCAST_DIGEST_WEBHOOK_ACK_FIELD: str = ""
@@ -334,8 +355,33 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_mode_requirements(self) -> Settings:
+        for value_field, file_field in (
+            ("ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_FILE"),
+            ("OPENAI_API_KEY", "OPENAI_API_KEY_FILE"),
+            ("PODCAST_DIGEST_SMTP_PASSWORD", "PODCAST_DIGEST_SMTP_PASSWORD_FILE"),
+            ("PODCAST_DIGEST_GRAPH_CLIENT_SECRET", "PODCAST_DIGEST_GRAPH_CLIENT_SECRET_FILE"),
+            ("PODCAST_DIGEST_WEBHOOK_TOKEN", "PODCAST_DIGEST_WEBHOOK_TOKEN_FILE"),
+        ):
+            secret_path = getattr(self, file_field)
+            if secret_path is not None and not getattr(self, value_field).strip():
+                try:
+                    secret = secret_path.read_text(encoding="utf-8").strip()
+                except OSError as exc:
+                    raise PydanticCustomError(
+                        "secret_file_unreadable",
+                        "{field} cannot be read",
+                        {"field": file_field},
+                    ) from exc
+                if not secret:
+                    raise PydanticCustomError(
+                        "secret_file_empty",
+                        "{field} is empty",
+                        {"field": file_field},
+                    )
+                setattr(self, value_field, secret)
         if self.summarizer_backend == "command" and not self.PODCAST_DIGEST_COMMAND.strip():
-            raise ValueError(
+            raise PydanticCustomError(
+                "command_required",
                 "PODCAST_DIGEST_COMMAND is required when "
                 "PODCAST_DIGEST_SUMMARIZER=command"
             )

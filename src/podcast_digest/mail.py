@@ -6,10 +6,9 @@
     registration (OAuth2 client_credentials). stdlib urllib, ~one endpoint, so
     no msal / msgraph-sdk.
 
-Both separate "nothing was accepted" (:class:`MailError`, safe to retry) from
-"the message was fully transmitted but no verdict came back"
-(:class:`MailProbablyDelivered`): sending is not idempotent, so the pipeline
-treats the latter as delivered rather than risk duplicate digests.
+MailError proves non-submission. MailOutcomeUnknown means that submission may
+have happened and must be held for positive observation, never treated as sent.
+A correlation key identifies an operation; neither backend deduplicates it.
 """
 from __future__ import annotations
 
@@ -61,34 +60,24 @@ _UPLOAD_TIMEOUT_BASE = 30.0
 
 
 class MailError(RuntimeError):
-    """Graph returned a non-2xx response or auth failed."""
+    """The provider accepted nothing; retrying the saved envelope is safe."""
 
 
-class MailProbablyDelivered(RuntimeError):
-    """The request was fully transmitted to Graph but no readable verdict came.
+class MailOutcomeUnknown(RuntimeError):
+    """Submission may have happened; neither success nor retry is justified."""
 
-    Graph sendMail is not idempotent, so this is the one genuinely ambiguous
-    outcome. Raised as a distinct type (NOT a MailError) so the pipeline can
-    choose the duplicate-avoiding branch: treat the episode as sent rather than
-    re-send up to MAX_ATTEMPTS copies. Timeouts during connect or while the
-    body is still uploading are NOT this — nothing was accepted, so they stay
-    ordinary retryable MailErrors.
 
-    Known, accepted imprecision: "fully transmitted" means the body left our
-    socket buffer, not that Graph ACKed it — for a small body the two can
-    differ if the network dies in the ~second between the TLS handshake and
-    the 202. That window is narrow (the handshake itself just round-tripped),
-    the failure is WARNING-logged with the episode title, and the worst case
-    is one missing digest — chosen deliberately over the alternative's N
-    duplicates. If a lost digest is ever actually observed, the escalation
-    path is a post-timeout Sent Items check via Graph (saveToSentItems=True
-    makes the send verifiable); not built now because the window hasn't been
-    seen in practice and it would add a permission dependency.
-    """
+class MailObservationError(RuntimeError):
+    """Read-back failed; it says nothing about an outstanding send's outcome."""
 
 
 class Mailer(Protocol):
     """What the pipeline needs from a mail backend."""
+
+    @property
+    def delivery_target(self) -> str:
+        """Stable transport and sender identity, excluding renewable credentials."""
+        ...
 
     def send(
         self,
@@ -98,8 +87,10 @@ class Mailer(Protocol):
         body_html: str,
         reply_to: str | None = None,
         attachments: list[MailAttachment] | None = None,
+        operation_id: str | None = None,
+        date_header: str | None = None,
     ) -> None:
-        """Deliver one message. Raises MailError or MailProbablyDelivered."""
+        """Deliver one message. Raises MailError or MailOutcomeUnknown."""
         ...
 
 
@@ -134,6 +125,8 @@ class GraphMailer:
         body_html: str,
         reply_to: str | None = None,
         attachments: list[MailAttachment] | None = None,
+        operation_id: str | None = None,
+        date_header: str | None = None,
     ) -> None:
         recipients = _recipients(to)
         if not recipients:
@@ -143,6 +136,10 @@ class GraphMailer:
             "body": {"contentType": "HTML", "content": body_html},
             "toRecipients": recipients,
         }
+        if operation_id:
+            message["internetMessageHeaders"] = [
+                {"name": "x-podcast-digest-operation", "value": operation_id},
+            ]
         if reply_to:
             message["replyTo"] = _recipients(reply_to)
         if attachments:
@@ -159,7 +156,7 @@ class GraphMailer:
             ]
         body = {"message": message, "saveToSentItems": True}
 
-        path = f"/users/{urllib.parse.quote(self.sender)}/sendMail"
+        path = f"/users/{urllib.parse.quote(self.sender, safe="")}/sendMail"
         self._post(path, body)
         event(
             logger, logging.INFO, "mail.sent",
@@ -168,6 +165,51 @@ class GraphMailer:
             bytes=len(body_html),
             attachments=[a.name for a in (attachments or [])],
         )
+
+    @property
+    def delivery_target(self) -> str:
+        return f"graph:{self.tenant_id}:{self.sender.casefold()}"
+
+    def sent_receipt(
+        self, *, operation_id: str, message_id: str, to: str, subject: str,
+    ) -> str | None:
+        """Observe a particular Sent Items message; absence never authorizes a retry.
+
+        Requires Mail.Read for this mailbox, in addition to Mail.Send. Custom
+        internet headers are supported on sendMail and readable with $select.
+        """
+        sender = urllib.parse.quote(self.sender, safe="")
+        item = urllib.parse.quote(message_id, safe="")
+        select = "id,isDraft,sentDateTime,internetMessageHeaders,subject,toRecipients,from"
+        url = f"{GRAPH_BASE}/users/{sender}/mailFolders/sentitems/messages/{item}?"
+        try:
+            req = urllib.request.Request(
+                url + urllib.parse.urlencode({"$select": select}),
+                headers={"Authorization": f"Bearer {self._get_token()}"},
+            )
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                message = json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            raise MailObservationError(f"Sent Items observation failed: HTTP {exc.code}") from exc
+        except (MailError, OSError, http.client.HTTPException, ValueError, KeyError) as exc:
+            raise MailObservationError("Sent Items observation unavailable") from exc
+        headers = message.get("internetMessageHeaders", [])
+        keys = [h.get("value") for h in headers
+                if h.get("name", "").casefold() == "x-podcast-digest-operation"]
+        expected = {r["emailAddress"]["address"].casefold() for r in _recipients(to)}
+        actual = {r["emailAddress"]["address"].casefold()
+                  for r in message.get("toRecipients", [])}
+        source = message.get("from", {}).get("emailAddress", {}).get("address", "")
+        if (
+            message.get("id") and message.get("isDraft") is False
+            and message.get("sentDateTime") and keys == [operation_id]
+            and message.get("subject") == subject and actual == expected
+            and source.casefold() == self.sender.casefold()
+        ):
+            return f"graph-sent-item:{message['id']}"
+        return None
 
     # ---- internals --------------------------------------------------------
 
@@ -194,70 +236,46 @@ class GraphMailer:
             return self._token
 
     def _post(self, path: str, body: dict) -> None:
-        """POST with the send/response phases separated.
-
-        urlopen collapses connect + upload + response-wait into one opaque
-        timeout, which makes a post-accept timeout indistinguishable from a
-        dead network — the ambiguity behind the duplicate-digest bug. With
-        http.client we know exactly how far the request got: a failure before
-        the body is fully written means Graph accepted nothing (safe to retry,
-        raise MailError); a timeout AFTER the body was transmitted means Graph
-        almost certainly queued the send (raise MailProbablyDelivered so the
-        caller doesn't re-send a duplicate).
-        """
-        token = self._get_token()
+        """Only failures before request I/O or explicit rejections permit retry."""
+        try:
+            token = self._get_token()
+        except MailError:
+            raise
+        except (OSError, http.client.HTTPException, ValueError, KeyError) as exc:
+            raise MailError("authentication failed before sendMail submission") from exc
         data = json.dumps(body).encode()
         timeout = upload_timeout(len(data), base=_UPLOAD_TIMEOUT_BASE)
         conn = http.client.HTTPSConnection(_GRAPH.netloc, timeout=timeout)
         try:
             try:
-                # Connect + transmit the full request (headers + body). Any
-                # failure here — DNS, TCP, TLS, mid-upload timeout/reset —
-                # happened before Graph could accept the message.
+                conn.connect()
+            except (OSError, http.client.HTTPException) as exc:
+                raise MailError("sendMail connection failed before submission") from exc
+            try:
                 conn.request(
-                    "POST",
-                    _GRAPH.path + path,
-                    body=data,
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Content-Type": "application/json",
-                    },
+                    "POST", _GRAPH.path + path, body=data,
+                    headers={"Authorization": f"Bearer {token}",
+                             "Content-Type": "application/json"},
                 )
-            except (TimeoutError, OSError) as e:
-                raise MailError(f"sendMail transmit failed: {e}") from e
-            try:
                 resp = conn.getresponse()
-            except http.client.RemoteDisconnected as e:
-                # Connection closed with ZERO response bytes: Graph never even
-                # started a reply, which reads as rejected-at-the-door (LB
-                # reset, server bounce) — retry rather than risk a lost digest.
-                raise MailError(
-                    f"sendMail: server closed connection without a response: {e}"
-                ) from e
-            except (TimeoutError, http.client.HTTPException) as e:
-                # No status line arrived (timeout), or what arrived was garbage
-                # (BadStatusLine through a flaky middlebox) — both mean the
-                # request went out but the verdict is unknowable. Bias
-                # anti-duplicate, loudly.
-                raise MailProbablyDelivered(
-                    f"sendMail response unreadable after full transmit "
-                    f"(timeout {timeout:.0f}s): {type(e).__name__}: {e}"
-                ) from e
-            except OSError as e:
-                raise MailError(f"sendMail response failed: {e}") from e
-            # Status line is in — from here the outcome is DEFINITIVE, so the
-            # body read must never re-enter the probably-delivered path: a
-            # stalled error-body on a 4xx/5xx is still a failed send (retry),
-            # and on a 2xx the body is empty/ignorable anyway.
+            except (OSError, http.client.HTTPException) as exc:
+                # sendall can submit every byte and still raise. A reset, EOF,
+                # or timeout at either boundary cannot prove non-submission.
+                raise MailOutcomeUnknown("sendMail submission verdict unavailable") from exc
             try:
-                detail = resp.read()  # /sendMail returns 202 No Content
-            except (TimeoutError, OSError, http.client.HTTPException):
+                detail = resp.read()
+            except (OSError, http.client.HTTPException):
                 detail = b""
-            if not (200 <= resp.status < 300):
+            if resp.status == 202:
+                return  # Graph's documented acceptance, even if body read failed.
+            if resp.status in {400, 401, 403, 404, 405, 413, 415, 422, 429}:
                 raise MailError(
-                    f"sendMail failed: HTTP {resp.status} "
+                    f"sendMail rejected: HTTP {resp.status} "
                     f"{detail.decode('utf-8', errors='replace')[:500]}"
                 )
+            # A server/proxy 5xx or unexpected status is no proof that its
+            # upstream did not queue this non-idempotent operation.
+            raise MailOutcomeUnknown(f"sendMail acceptance unknown: HTTP {resp.status}")
         finally:
             conn.close()
 
@@ -295,15 +313,15 @@ def _safe_read(e: urllib.error.HTTPError) -> str:
 
 
 class _PayloadTracking:
-    """Remembers whether the DATA payload (which ends in CRLF.CRLF) has left
-    our socket: a failure after that point is ambiguous, before it is not."""
+    """Track possible DATA submission before entering the socket write."""
 
-    payload_sent = False
+    payload_started = False
 
     def send(self, s):  # type: ignore[no-untyped-def]
-        super().send(s)  # type: ignore[misc]
         if isinstance(s, bytes | bytearray) and bytes(s).endswith(b"\r\n.\r\n"):
-            self.payload_sent = True
+            # Mark BEFORE sendall: an exception does not say how much arrived.
+            self.payload_started = True
+        super().send(s)  # type: ignore[misc]
 
 
 class _SMTP(_PayloadTracking, smtplib.SMTP):
@@ -334,6 +352,10 @@ class SmtpMailer:
         self.password = password
         self.security = security
 
+    @property
+    def delivery_target(self) -> str:
+        return f"smtp:{self.host.casefold()}:{self.port}:{self.sender.casefold()}"
+
     def send(
         self,
         *,
@@ -342,6 +364,8 @@ class SmtpMailer:
         body_html: str,
         reply_to: str | None = None,
         attachments: list[MailAttachment] | None = None,
+        operation_id: str | None = None,
+        date_header: str | None = None,
     ) -> None:
         recipients = [r["emailAddress"]["address"] for r in _recipients(to)]
         if not recipients:
@@ -350,8 +374,13 @@ class SmtpMailer:
         msg["From"] = self.sender
         msg["To"] = ", ".join(recipients)
         msg["Subject"] = subject
-        msg["Date"] = formatdate(usegmt=True)
-        msg["Message-ID"] = make_msgid(domain=self.sender.rpartition("@")[2] or None)
+        msg["Date"] = date_header or formatdate(usegmt=True)
+        domain = self.sender.rpartition("@")[2] or "localhost"
+        msg["Message-ID"] = (
+            f"<{operation_id}@{domain}>" if operation_id else make_msgid(domain=domain)
+        )
+        if operation_id:
+            msg["X-Podcast-Digest-Operation"] = operation_id
         if reply_to:
             msg["Reply-To"] = ", ".join(
                 r["emailAddress"]["address"] for r in _recipients(reply_to)
@@ -391,11 +420,11 @@ class SmtpMailer:
                 # The server answered with a definite rejection.
                 raise MailError(f"SMTP send rejected: {e}") from e
             except (smtplib.SMTPException, OSError) as e:
-                if smtp.payload_sent:
-                    # The whole message went out; only the server's verdict was
-                    # lost. Bias anti-duplicate, loudly.
-                    raise MailProbablyDelivered(
-                        f"SMTP verdict lost after full transmit: {type(e).__name__}: {e}"
+                if smtp.payload_started:
+                    # A socket error cannot prove how much DATA arrived.
+                    # Hold until positive evidence is available.
+                    raise MailOutcomeUnknown(
+                        f"SMTP verdict unknown after possible submission: {type(e).__name__}: {e}"
                     ) from e
                 raise MailError(f"SMTP send failed: {e}") from e
         finally:
@@ -413,12 +442,14 @@ class SmtpMailer:
         )
 
 
+_STYLE_BLOCK_RE = re.compile(r"<style[^>]*>.*?</style>", re.IGNORECASE | re.DOTALL)
 _BLOCK_END_RE = re.compile(r"</(p|h[1-6]|li|ul|ol|div|tr)>|<br\s*/?>", re.IGNORECASE)
 
 
 def _html_to_text(body_html: str) -> str:
     """A readable plain-text rendering of the digest HTML."""
-    text = re.sub(r"<li[^>]*>", "- ", body_html, flags=re.IGNORECASE)
+    text = _STYLE_BLOCK_RE.sub("", body_html)
+    text = re.sub(r"<li[^>]*>", "- ", text, flags=re.IGNORECASE)
     text = _BLOCK_END_RE.sub("\n", text)
     text = re.sub(r"<[^>]+>", "", text)
     text = html.unescape(text)

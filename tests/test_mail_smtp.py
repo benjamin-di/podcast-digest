@@ -4,7 +4,7 @@ The server speaks just enough SMTP for smtplib (EHLO, MAIL, RCPT, DATA, QUIT)
 and can misbehave after the message body arrives, so the tests pin the same
 classification as the Graph mailer: a definite rejection or a failure before
 the body left is a retryable MailError; a lost verdict after the full body went
-out is MailProbablyDelivered (the pipeline treats it as sent).
+out is MailOutcomeUnknown (the pipeline holds it for observation).
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ import pytest
 from podcast_digest.mail import (
     MailAttachment,
     MailError,
-    MailProbablyDelivered,
+    MailOutcomeUnknown,
     SmtpMailer,
     _html_to_text,
 )
@@ -123,9 +123,9 @@ def test_sends_html_with_text_part_and_attachment():
     assert server.commands.count("RCPT") == 2
 
 
-def test_lost_verdict_after_full_body_is_probably_delivered():
+def test_lost_verdict_after_full_body_is_unknown():
     server = _Server(after_data="drop")
-    with pytest.raises(MailProbablyDelivered):
+    with pytest.raises(MailOutcomeUnknown):
         _send(_mailer(server.port))
     assert len(server.messages) == 1  # the body did arrive
 
@@ -159,3 +159,37 @@ def test_invalid_recipient_fails_before_connecting():
 def test_html_to_text_is_readable():
     text = _html_to_text("<h2>A</h2><p>x<br>y</p><ul><li>one</li><li>two</li></ul>")
     assert text == "A\nx\ny\n- one\n- two\n"
+
+
+def test_operation_header_and_message_id_survive_safe_retry():
+    ids = []
+    dates = []
+    for _ in range(2):
+        server = _Server()
+        _send(_mailer(server.port), operation_id="a" * 32,
+              date_header="Sun, 08 Nov 2026 00:00:00 GMT")
+        server.thread.join(timeout=5)
+        msg = email.message_from_bytes(server.messages[0], policy=policy.default)
+        assert msg["X-Podcast-Digest-Operation"] == "a" * 32
+        ids.append(msg["Message-ID"])
+        dates.append(msg["Date"])
+    assert ids == [f"<{'a' * 32}@example.com>"] * 2
+    assert dates[0] == dates[1]
+
+
+def test_data_socket_error_after_possible_write_is_unknown(monkeypatch):
+    import smtplib
+
+    original = smtplib.SMTP.send
+
+    def transmit_then_raise(self, value):
+        original(self, value)
+        if isinstance(value, bytes) and value.endswith(b"\r\n.\r\n"):
+            raise OSError("sendall lost its completion verdict")
+
+    monkeypatch.setattr(smtplib.SMTP, "send", transmit_then_raise)
+    server = _Server()
+    with pytest.raises(MailOutcomeUnknown):
+        _send(_mailer(server.port))
+    server.thread.join(timeout=5)
+    assert len(server.messages) == 1

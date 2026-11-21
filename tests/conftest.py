@@ -26,6 +26,7 @@ import respx
 
 from podcast_digest.config import Feed, FeedsFile, Settings
 from podcast_digest.db import Database
+from podcast_digest.mail import MailError
 from podcast_digest.transcribe import Segment, Transcript
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -94,10 +95,12 @@ class FakeMailer:
     so this needs to be sync — same signature as the real one.
     """
 
+    delivery_target = "test:bot@example.com"
+
     def __init__(self, fail: bool = False, exc: Exception | None = None):
         self.sent: list[dict[str, Any]] = []
         self.fail = fail
-        self.exc = exc or RuntimeError("synthetic mail failure")
+        self.exc = exc or MailError("synthetic mail failure")
 
     def send(self, *, to, subject, body_html, attachments=None, **_extra):
         if self.fail:
@@ -105,6 +108,8 @@ class FakeMailer:
         self.sent.append({
             "to": to, "subject": subject, "body_html": body_html,
             "attachments": attachments or [],
+            "operation_id": _extra.get("operation_id"),
+            "date_header": _extra.get("date_header"),
         })
 
 
@@ -231,6 +236,10 @@ def mock_transcribe(monkeypatch):
         calls.append({
             "audio_path": str(audio_path), "basename": basename,
             "model_path": str(model_path), "language": language,
+            "parakeet_model_dir": _kw.get("parakeet_model_dir"),
+            "parakeet_threads": _kw.get("parakeet_threads"),
+            "qwen_model_dir": _kw.get("qwen_model_dir"),
+            "qwen_threads": _kw.get("qwen_threads"),
         })
         out_dir.mkdir(parents=True, exist_ok=True)
         txt_path = out_dir / f"{basename}.txt"

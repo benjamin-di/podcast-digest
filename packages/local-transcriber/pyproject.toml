@@ -1,7 +1,7 @@
 [project]
 name = "local-transcriber"
-version = "0.2.0"
-description = "Atomic local whisper.cpp transcription with timestamped artifacts"
+version = "0.4.1"
+description = "Atomic local transcription with timestamped artifacts"
 license = "MIT"
 requires-python = ">=3.12"
 dependencies = []
@@ -23,3 +23,6 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
 ignore = ["E501"]
+
+[tool.hatch.build.hooks.custom]
+stamps = { local-transcriber = "src/local_transcriber/build_identity.json" }

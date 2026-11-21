@@ -28,12 +28,18 @@ WORKDIR /app
 
 # Copy package metadata first so the dep install layer caches separately from
 # source changes.
-COPY pyproject.toml uv.lock README.md LICENSE NOTICE ./
+COPY pyproject.toml uv.lock README.md LICENSE NOTICE hatch_build.py ./
 COPY packages/local-transcriber ./packages/local-transcriber
 COPY src ./src
 
-RUN python -m pip install --no-cache-dir --upgrade pip==26.2.0 \
- && pip install --no-cache-dir -e ./packages/local-transcriber \
+COPY scripts/embed-build-identity.py ./scripts/embed-build-identity.py
+ARG VERSION
+ARG TRANSCRIBER_VERSION
+ARG VCS_REF
+RUN python scripts/embed-build-identity.py podcast-digest "$VERSION" "$VCS_REF" \
+ && python scripts/embed-build-identity.py local-transcriber "$TRANSCRIBER_VERSION" "$VCS_REF" \
+ && python -m pip install --no-cache-dir --upgrade pip==26.2.0 \
+ && pip install --no-cache-dir ./packages/local-transcriber \
  && pip install --no-cache-dir ".[mcp]"
 
 RUN useradd -u 1001 -m -s /usr/sbin/nologin mcp && \

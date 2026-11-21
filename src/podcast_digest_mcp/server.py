@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
 
 import httpx
@@ -16,10 +17,12 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from podcast_digest import USER_AGENT, __version__
-from podcast_digest.net import validate_async_request, validate_request
+from podcast_digest import USER_AGENT
+from podcast_digest.log import configure, diagnostic, stamp_handlers
+from podcast_digest.net import build_async_client, build_sync_client
 
 from . import tools
+from .identity import BUILD
 
 logger = logging.getLogger(__name__)
 
@@ -30,26 +33,26 @@ def build_app():
     """Construct the FastMCP server and the ASGI app to serve."""
     token = os.environ.get("PODCAST_MCP_BEARER_TOKEN")
     if not token:
-        raise RuntimeError("PODCAST_MCP_BEARER_TOKEN must be set")
+        raise RuntimeError(diagnostic("PODCAST_MCP_BEARER_TOKEN must be set", record_name=__name__))
 
     feeds_path = Path(os.environ.get("PODCAST_DIGEST_CONFIG", "/app/config/feeds.toml"))
+    data_dir_env = os.environ.get("PODCAST_DIGEST_DATA_DIR", "").strip()
+    data_dir = Path(data_dir_env) if data_dir_env else None
 
-    http_async = httpx.AsyncClient(
+    http_async = build_async_client(
         timeout=httpx.Timeout(30.0, connect=10.0),
         follow_redirects=True,
         headers={"User-Agent": USER_AGENT},
-        event_hooks={"request": [validate_async_request]},
     )
-    http_sync = httpx.Client(
+    http_sync = build_sync_client(
         timeout=httpx.Timeout(15.0, connect=10.0),
         follow_redirects=True,
         headers={"User-Agent": USER_AGENT},
-        event_hooks={"request": [validate_request]},
     )
 
     mcp = FastMCP(
         "podcast-digest",
-        version=__version__,  # serverInfo: this package's version, not FastMCP's
+        version=BUILD.version,  # serverInfo: this package's version, not FastMCP's
         # Header bearer only: tokens in URLs end up in access logs.
         auth=StaticTokenVerifier(tokens={token: {"client_id": "bearer", "scopes": []}}),
         # Unexpected exceptions reach clients as a generic error, not their
@@ -64,7 +67,9 @@ def build_app():
     async def _health(_request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok"})
 
-    tools.register(mcp, feeds_path=feeds_path, http=http_async, http_sync=http_sync)
+    tools.register(
+        mcp, feeds_path=feeds_path, http=http_async, http_sync=http_sync, data_dir=data_dir,
+    )
 
     # Stateless streamable HTTP with plain JSON replies: no in-memory MCP
     # sessions to lose on every deploy or container restart, and no SSE reply
@@ -82,22 +87,49 @@ def build_app():
 
 def main() -> None:
     import uvicorn
+    from uvicorn.logging import AccessFormatter
 
-    # stdlib logging wants an UPPER-case level name ("INFO"); uvicorn wants it
-    # lower-case ("info"). Normalise the single LOG_LEVEL env for both so a
-    # lower-case value (as the compose sets) doesn't crash basicConfig.
     log_level = os.environ.get("LOG_LEVEL", "INFO")
-    logging.basicConfig(
-        level=log_level.upper(),
-        format='{"ts":"%(asctime)s","lvl":"%(levelname)s","logger":"%(name)s","msg":%(message)r}',
-    )
-    _mcp, app = build_app()
-    uvicorn.run(
-        app,
-        host=os.environ.get("HOST", "0.0.0.0"),
-        port=int(os.environ.get("PORT", "8000")),
-        log_level=log_level.lower(),
-    )
+    stage = "logging"
+    try:
+        configure(log_level, mcp=True)
+        stage = "application"
+        _mcp, app = build_app()
+        stamp_handlers(mcp=True)
+        stage = "listener_settings"
+        port = int(os.environ.get("PORT", "8000"))
+        stage = "listener"
+        access = logging.getLogger("uvicorn.access")
+        if not access.handlers and access.propagate and not access.disabled:
+            handler = logging.StreamHandler(sys.stdout)
+            handler.setFormatter(AccessFormatter(
+                '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+                use_colors=False,
+            ))
+            access.addHandler(handler)
+            access.propagate = False
+            if access.level == logging.NOTSET:
+                access.setLevel(log_level.upper())
+        stamp_handlers(mcp=True)
+        uvicorn.run(
+            app,
+            host=os.environ.get("HOST", "0.0.0.0"),
+            port=port,
+            # Inherit the configured thresholds without replacing SDK sinks.
+            log_level=None,
+            log_config=None,
+        )
+    except Exception as exc:
+        configure("ERROR", mcp=True)
+        fields = {"reason": f"{stage}_startup_failed", "error_type": type(exc).__name__}
+        if stage == "logging":
+            fields.update(reason="invalid_log_level", setting="LOG_LEVEL")
+        elif not os.environ.get("PODCAST_MCP_BEARER_TOKEN"):
+            fields.update(reason="missing_bearer_token", setting="PODCAST_MCP_BEARER_TOKEN")
+        elif stage == "listener_settings" and isinstance(exc, ValueError):
+            fields.update(reason="invalid_listener_port", setting="PORT")
+        logger.error("MCP startup failed; details withheld.", extra={"extras": fields})
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

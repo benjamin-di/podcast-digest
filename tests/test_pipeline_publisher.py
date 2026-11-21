@@ -51,8 +51,10 @@ def _serve(mock_http, *, transcript: httpx.Response) -> None:
 
 
 async def test_publisher_transcript_replaces_download_and_whisper(
-    settings, db, feeds_file, mock_llm, mock_transcribe, mock_http,
+    settings, db, feeds_file, mock_llm, mock_transcribe, mock_http, tmp_path,
 ):
+    settings.PODCAST_DIGEST_PARAKEET_MODEL_DIR = tmp_path / "parakeet"
+    settings.PODCAST_DIGEST_QWEN_MODEL_DIR = tmp_path / "qwen"
     _serve(mock_http, transcript=httpx.Response(200, text=_vtt()))
     mailer = FakeMailer()
 

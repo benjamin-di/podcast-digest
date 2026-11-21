@@ -14,7 +14,6 @@
 # ============================================================================
 
 ARG OPENVINO_IMAGE=openvino/ubuntu24_runtime:2026.4.1@sha256:ef00731944b89db0148ff41bae9ef5f581dc9a1a2de90b1dd9a8ce1af69dc7b5
-ARG SOURCE_REVISION=unknown
 
 # ----------------------------------------------------------------------------
 # Stage 1: build whisper-cli
@@ -127,7 +126,13 @@ RUN /opt/venv/bin/pip install --upgrade pip==26.2.2 setuptools==80.9.0 wheel==0.
 # local-transcriber image, for other jobs that need local transcription.
 WORKDIR /app
 COPY packages/local-transcriber /app/packages/local-transcriber
-RUN /opt/venv/bin/pip install -e ./packages/local-transcriber
+COPY scripts/embed-build-identity.py /app/scripts/embed-build-identity.py
+ARG VERSION
+ARG VCS_REF
+# Alternate podcast-runtime target supplies its own VERSION plus this input.
+ARG TRANSCRIBER_VERSION
+RUN python scripts/embed-build-identity.py local-transcriber "${TRANSCRIBER_VERSION:-$VERSION}" "$VCS_REF" \
+ && /opt/venv/bin/pip install ./packages/local-transcriber
 
 # Model provisioning is shared by the generic runtime and the podcast image.
 COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
@@ -135,11 +140,10 @@ COPY deploy/prepare-models.sh /usr/local/bin/prepare-models.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/prepare-models.sh
 
 # Commit metadata must not invalidate apt, Whisper compilation or Torch.
-ARG SOURCE_REVISION
 ENV WHISPER_MODEL_DIR=/models \
     WHISPER_BIN=/usr/local/bin/whisper-cli \
     WHISPER_LD_PATH=/usr/local/lib/whisper:/opt/intel/openvino/runtime/lib/intel64 \
-    LOCAL_TRANSCRIBER_SOURCE_REV=${SOURCE_REVISION}
+    LOCAL_TRANSCRIBER_SOURCE_REV=${VCS_REF}
 
 # Licences of what this image redistributes: this project (LICENSE, NOTICE) and
 # whisper.cpp (MIT). Distro packages keep theirs under /usr/share/doc; the
@@ -157,12 +161,16 @@ CMD ["local-transcribe", "--help"]
 FROM transcriber-runtime AS podcast-runtime
 
 WORKDIR /app
-COPY pyproject.toml README.md /app/
+COPY pyproject.toml README.md hatch_build.py /app/
 COPY src /app/src
-RUN /opt/venv/bin/pip install -e .
+ARG VERSION
+ARG VCS_REF
+RUN python scripts/embed-build-identity.py podcast-digest "$VERSION" "$VCS_REF" \
+ && /opt/venv/bin/pip install '.[parakeet]'
 
 # Example feeds.toml (mount your own over it).
 COPY feeds.toml /app/feeds.toml
+COPY --chmod=0755 deploy/podcast-entrypoint.sh deploy/prepare-onnx-model.sh /usr/local/bin/
 
 # The quickstart compose file mounts a data volume at /data and points
 # PODCAST_DIGEST_CONFIG at its config directory instead of this example.
@@ -181,4 +189,5 @@ ENV WHISPER_MODEL_DIR=/data/models \
 HEALTHCHECK --interval=5m --timeout=10s --start-period=10m --start-interval=2s --retries=3 \
     CMD pgrep -f "podcast_digest.*serve|podcast-digest serve" >/dev/null || exit 1
 
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/podcast-entrypoint.sh"]
 CMD ["podcast-digest", "serve"]

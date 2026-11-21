@@ -4,9 +4,20 @@ set -euo pipefail
 variant="${1:?variant required}"
 image="${2:?image required}"
 revision="${3:?revision required}"
-version="${4:?version required}"
+version="${4:?image release version required}"
+transcriber_version="${5:?transcriber product version required}"
 docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image"
 test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$revision"
+test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$version"
+if [ -n "${GITHUB_REPOSITORY:-}" ]; then
+  test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" = "https://github.com/$GITHUB_REPOSITORY"
+else
+  echo "GITHUB_REPOSITORY is required to verify the image source" >&2
+  exit 1
+fi
+# Execute the same installed-metadata acceptance used by offline fixture tests.
+docker run --rm -i --network none --read-only --tmpfs /tmp --entrypoint python \
+  "$image" - "$variant" "$revision" "$version" "$transcriber_version" < scripts/check-image-identity.py
 case "$variant" in
   transcriber|podcast)
     docker run --rm --network none --read-only --tmpfs /tmp --entrypoint /bin/bash \
@@ -18,6 +29,7 @@ case "$variant" in
         local-transcribe --help >/dev/null
         if [ "$SMOKE_VARIANT" = podcast ]; then
           python -c '\''import importlib.metadata, os; assert importlib.metadata.version("podcast-digest") == os.environ["EXPECTED_VERSION"]'\''
+          python -c '\''import numpy, sherpa_onnx; from local_transcriber import ParakeetConfig, QwenConfig; assert hasattr(sherpa_onnx.OfflineRecognizer, "from_qwen3_asr")'\''
           podcast-digest check-config /app/feeds.toml
         fi
       '
@@ -38,8 +50,9 @@ case "$variant" in
       -X POST -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
       --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"image-smoke","version":"1"}}}' \
       http://127.0.0.1:8000/mcp)" = 401
-    docker exec -i "$cid" python - <<'PY'
+    docker exec -i -e EXPECTED_VERSION="$version" "$cid" python - <<'PY'
 import json
+import os
 import urllib.request
 
 headers = {"Authorization": "Bearer isolated-image-smoke",
@@ -60,6 +73,7 @@ message = json.loads(body)
 assert message.get("id") == 1, message
 result = message["result"]
 assert result["serverInfo"]["name"] == "podcast-digest", result
+assert result["serverInfo"]["version"] == os.environ["EXPECTED_VERSION"], result
 assert "tools" in result["capabilities"], result
 print("authenticated MCP initialize passed; no tools invoked")
 PY

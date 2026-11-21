@@ -83,7 +83,8 @@ async def test_transcribe_file_uses_unique_staging_and_publishes_manifest_last(
     calls: list[list[str]] = []
 
     monkeypatch.setattr(whisper.shutil, "which", lambda _name: "/bin/tool")
-    monkeypatch.setenv("LOCAL_TRANSCRIBER_SOURCE_REV", "abc123")
+    monkeypatch.setattr(whisper, "BUILD", whisper.BUILD.__class__("local-transcriber", "0.2.0", "a" * 40))
+    monkeypatch.setenv("LOCAL_TRANSCRIBER_SOURCE_REV", "ignored")
 
     async def fake_run(cmd, *, timeout, label, env=None):
         calls.append(cmd)
@@ -124,8 +125,8 @@ async def test_transcribe_file_uses_unique_staging_and_publishes_manifest_last(
     assert manifest["engine_version"] == "v1.7.4"
     assert manifest["input_sha256"] == result.input_sha256
     assert manifest["model_sha256"] == result.model_sha256
-    assert manifest["local_transcriber_source_revision"] == "abc123"
-    assert result.source_revision == "abc123"
+    assert manifest["local_transcriber_source_revision"] == "a" * 40
+    assert result.source_revision == "a" * 40
     assert manifest["initial_prompt"] == "Example Bank, CET1, NII"
     assert len(manifest["initial_prompt_sha256"]) == 64
     whisper_cmd = calls[1]

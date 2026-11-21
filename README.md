@@ -1,10 +1,10 @@
 # podcast-digest
 
 Follow podcasts and YouTube channels, transcribe every new episode locally with
-[whisper.cpp](https://github.com/ggml-org/whisper.cpp), and get an email per
-episode with an LLM-written summary — TL;DR, speakers, key takeaways, claims,
-timestamped highlights, "worth listening in full?" — and optionally a cleaned-up
-transcript attached.
+Parakeet, Qwen3-ASR, or [whisper.cpp](https://github.com/ggml-org/whisper.cpp),
+and get an email per episode with an LLM-written summary — TL;DR, speakers, key
+takeaways, claims, timestamped highlights, "worth listening in full?" — and
+optionally a cleaned-up transcript attached.
 
 - **Sources:** podcast RSS feeds, a podcast name (resolved via the iTunes
   Search API), Apple Podcasts links, YouTube channels, single YouTube videos and
@@ -12,9 +12,11 @@ transcript attached.
 - **Publisher transcripts first:** when a feed links the episode's own
   transcript (Podcasting 2.0 `<podcast:transcript>`), it is used as is — no
   download, no transcription, speaker names included.
-- **Local transcription otherwise:** whisper.cpp, accelerated by an Intel iGPU
-  through OpenVINO when one is available, on the CPU otherwise. Non-English
-  feeds use a multilingual model and still get an English summary.
+- **Local transcription otherwise:** optional Parakeet Unified English INT8 on
+  the CPU for English audio and Qwen3-ASR 0.6B INT8 on the CPU for Chinese
+  (`zh`/`yue`), each with whisper.cpp fallback. Whisper uses OpenVINO on a
+  supported Intel iGPU or runs on the CPU, and handles all other languages.
+  Non-English feeds still get an English summary.
 - **Any LLM:** Anthropic, OpenAI, a local or self-hosted OpenAI-compatible
   server (Ollama, LM Studio, vLLM), or any command-line tool (`claude -p`,
   `llm`, …), locally or on another machine over SSH.
@@ -33,6 +35,9 @@ transcript attached.
 git clone https://github.com/benjamin-di/podcast-digest.git && cd podcast-digest
 mkdir -p config && cp feeds.toml config/feeds.toml   # your subscriptions + recipient
 cp example.env .env                                  # mail + LLM settings
+export VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+export TRANSCRIBER_VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("packages/local-transcriber/pyproject.toml", "rb"))["project"]["version"])')"
+export VCS_REF="$(git rev-parse HEAD)"
 docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
 docker compose --env-file .env -f deploy/docker-compose.yml logs -f
 ```
@@ -58,6 +63,7 @@ The shows, addresses and IDs below are placeholders; put your own in.
 recipient = "you@example.com"   # comma-separated for several
 poll_seconds = 21600            # between polls (default 6 h)
 min_minutes = 5                 # skip anything shorter (teasers, promos)
+max_new_per_tick = 1            # steady-state cap per feed per tick (first run stays 1)
 
 [[feeds]]
 name = "Market Hours"
@@ -119,9 +125,53 @@ variable counts as unset.
 | `PODCAST_DIGEST_SMTP_USERNAME` / `_PASSWORD` | | Login, if the server needs one |
 | `PODCAST_DIGEST_GRAPH_TENANT_ID` / `_CLIENT_ID` / `_CLIENT_SECRET` | | Microsoft 365: an Entra ID app registration with the `Mail.Send` application permission (scope it to the sender mailbox) |
 
-Sending is not idempotent, so when a message has been fully transmitted but the
-server's answer is lost, the episode is treated as sent (logged as
-`mail.probably_delivered`) rather than risking duplicate digests.
+Each digest commits a stable operation ID, transport target and complete envelope
+(recipient, subject, HTML and attachment bytes) to SQLite before submission.
+The key is correlation, not provider deduplication. A lost verdict, process crash
+or storage failure after possible submission leaves an `unknown` operation held
+at `summarized`: no automatic resend, `emailed` watermark, webhook or sent cleanup.
+Only a proven pre-submission failure or explicit rejection permits a later attempt
+with the same saved envelope. Graph 5xx responses and socket closure are uncertain.
+A safe retry still checks positive GUID and transcript delivery evidence. A match
+suppresses the retry while preserving its non-submission outcome and saved envelope;
+it does not manufacture an acceptance receipt. Unknown sends remain held even when
+another delivery matches.
+A crash immediately before sending also stays held; a local journal cannot prove
+which side of submission a crashed process reached.
+
+Inspect and reconcile under the same single-writer lock used by ticks:
+
+```bash
+uv run podcast-digest delivery list
+uv run podcast-digest delivery inspect OPERATION_ID
+uv run podcast-digest delivery reconcile OPERATION_ID --graph-message-id MESSAGE_ID
+```
+
+`inspect` includes the saved message and attachments; treat its output as private.
+Find the candidate message in the sender mailbox's Sent Items through an authorized
+mail client or Graph read tool, then pass its Graph message ID. Reconciliation reads
+that item through Graph and requires a matching `x-podcast-digest-operation` header,
+sender, recipients, subject and positive sent metadata. It records the receipt and
+`emailed` watermark in one transaction. It never sends mail. This read requires
+`Mail.Read` on the sender mailbox in addition to `Mail.Send`; lack of permission,
+a missing/moved item or an observation error leaves the operation held. A missing
+receipt, expired lock or old operation is never proof of non-submission.
+
+Ordinary acceptance and positive reconciliation both publish the shared delivery
+log and clean up sent audio. These steps are journaled separately from acceptance:
+if interrupted or unsuccessful, the next real tick retries them without sending
+mail, even if the feed has been removed from configuration. A successful recovery
+command also attempts pending finalization under the writer lock. The shared log
+is a cross-instance hint, not a distributed lock; independent instances can still
+race before either publishes its accepted delivery.
+
+SMTP carries the same operation header and a stable Message-ID, but has no supported
+Sent Items API here. Its unknown operations remain held for provider investigation;
+there is deliberately no force-retry or unchecked mark-sent command. Keep the state
+database and artifacts when investigating. Do not delete unknown rows or clear their
+state to retry. Restarted ticks report the operation ID and inspection command.
+Keep the original transport target configured to retry a proven non-submission.
+A changed mailbox/backend cannot take over an existing operation.
 
 ### Summarizer
 
@@ -130,7 +180,7 @@ server's answer is lost, the episode is treated as sent (logged as
 | `PODCAST_DIGEST_SUMMARIZER` | `api` | `api` or `command` |
 | `PODCAST_DIGEST_MODEL` | `claude-opus-5-5` | `api`: the model. `claude-*` uses Anthropic (`claude-sonnet-5-5` is cheaper), anything else OpenAI or a compatible server |
 | `PODCAST_DIGEST_PROVIDER` | `auto` | Force `anthropic` or `openai` |
-| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | | The provider's key |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | | The provider's key (or `*_FILE` to read from a mounted secret file; `PODCAST_DIGEST_SMTP_PASSWORD_FILE`, `PODCAST_DIGEST_GRAPH_CLIENT_SECRET_FILE`, and `PODCAST_DIGEST_WEBHOOK_TOKEN_FILE` work the same way) |
 | `PODCAST_DIGEST_OPENAI_BASE_URL` | | An OpenAI-compatible server, e.g. `http://localhost:11434/v1` for Ollama (no key needed) |
 | `PODCAST_DIGEST_COMMAND` | | `command`: run this per LLM call, prompt on stdin |
 | `PODCAST_DIGEST_SSH_HOST` (+ `_PORT`, `_USER`, `_KEY` or `_KEY_B64`, `_KNOWN_HOSTS` or `_KNOWN_HOSTS_B64`) | | Run the command on another host over SSH |
@@ -179,10 +229,15 @@ transcript with `[hh:mm:ss]` markers.
 |---|---|---|
 | `PODCAST_DIGEST_PUBLISHER_TRANSCRIPTS` | `true` | Use transcripts the feeds link (see below) before transcribing locally |
 | `PODCAST_DIGEST_WHISPER_MODELS` | `medium.en` | Models fetched on first start; add `large-v3-turbo` for non-English feeds |
-| `PODCAST_DIGEST_WHISPER_MODEL` | `/data/models/ggml-medium.en.bin` | English model |
+| `PODCAST_DIGEST_WHISPER_MODEL` | `/data/models/ggml-medium.en.bin` | Default Whisper model, including English fallback |
 | `PODCAST_DIGEST_WHISPER_MODEL_MULTILINGUAL` | `/data/models/ggml-large-v3-turbo.bin` | For feeds with a `language` |
 | `PODCAST_DIGEST_WHISPER_LANGUAGE` | `en` | Language passed to whisper for feeds without a `language` |
 | `PODCAST_DIGEST_WHISPER_THREADS` | `8` | CPU threads |
+| `PODCAST_DIGEST_PARAKEET_MODEL_DIR` | unset | Enable Parakeet for English and cache the pinned INT8 ONNX assets in this directory |
+| `PODCAST_DIGEST_PARAKEET_WORKER_SSH_CONFIG` | unset | Optional OpenSSH config for the English decoder, using the host alias `parakeet-worker` |
+| `PODCAST_DIGEST_PARAKEET_THREADS` | `4` | Parakeet CPU threads |
+| `PODCAST_DIGEST_QWEN_MODEL_DIR` | unset | Enable Qwen3-ASR 0.6B for Chinese and cache the pinned INT8 ONNX assets in this directory |
+| `PODCAST_DIGEST_QWEN_THREADS` | `4` | Qwen CPU threads |
 | `PODCAST_DIGEST_WHISPER_BIN` | `/usr/local/bin/whisper-cli` | whisper.cpp binary |
 | `PODCAST_DIGEST_OPENVINO` | `auto` | Convert models for OpenVINO: `auto` (only with a `/dev/dri` GPU), `on`, `off` |
 | `WHISPER_GPU_LOCK_PATH` | | A lock file shared with other containers that use the same GPU |
@@ -200,6 +255,48 @@ transcript with `[hh:mm:ss]` markers.
 | `PODCAST_DIGEST_CONFIG` | Path of `feeds.toml` (default `/app/feeds.toml`; in the MCP image `/app/config/feeds.toml`) |
 | `PODCAST_DIGEST_WAKE_POLL_SECONDS` | How often the scheduler checks for an MCP "process now" signal (default 15) |
 | `LOG_LEVEL` | Default `INFO`; logs are one JSON object per line when not on a terminal |
+
+## English transcription with Parakeet
+
+Set `PODCAST_DIGEST_PARAKEET_MODEL_DIR` to a directory on the data volume,
+such as `/data/models/parakeet-unified-en-0.6b-int8`. The engine image includes
+the CPU runtime. It downloads the pinned INT8 ONNX export on first start and
+verifies the cached assets on later starts. The offline worker splits long
+audio near quiet boundaries around 30 seconds and writes the same timestamped
+text and JSON artifacts used by the rest of the digest. Publisher transcripts
+retain priority. A missing runtime, unavailable model, inference error, or
+empty result falls back to Whisper. Unset the directory to select Whisper
+directly. Keep the intended Whisper models available in either mode.
+
+An enabled English model can also use a native SSH worker. Set
+`PODCAST_DIGEST_PARAKEET_WORKER_SSH_CONFIG` to a read-only SSH configuration
+with a pinned host key and a dedicated identity for the alias `parakeet-worker`.
+Restrict that identity to a forced command running
+`python -m local_transcriber.worker --model-dir MODEL_DIR --lock-path LOCK_FILE`
+from an installed, revision-stamped wheel with the Parakeet dependencies.
+The worker takes one normalized WAV at a time, uses four CPU threads by default,
+and discards temporary audio when the request finishes or disconnects. It returns
+timestamped segments and the decoder's version, model digest and source revision.
+A busy or unavailable worker or invalid reply retries the same WAV with local
+Parakeet. The existing Whisper fallback still applies after local Parakeet failure.
+
+For a source install, use `pip install ./packages/local-transcriber '.[parakeet]'`
+and run `deploy/prepare-onnx-model.sh parakeet <model-dir>`. The
+[NVIDIA model card](https://huggingface.co/nvidia/parakeet-unified-en-0.6b)
+links to the NVIDIA Open Model License for the weights.
+
+## Chinese transcription with Qwen
+
+Set `PODCAST_DIGEST_QWEN_MODEL_DIR` to a persistent directory such as
+`/data/models/qwen3-asr-0.6b-int8`, and set the feed language to `zh` for
+Mandarin or `yue` for Cantonese. Publisher transcripts still take priority.
+The engine verifies the pinned CPU model on startup and falls back to
+multilingual Whisper if the model is unavailable or inference fails.
+Qwen transcript timestamps mark audio chunks of roughly 20 seconds.
+
+For a source install, use the same `parakeet` extra for the shared runtime
+and run `deploy/prepare-onnx-model.sh qwen <model-dir>`.
+[Qwen3-ASR model card](https://huggingface.co/Qwen/Qwen3-ASR-0.6B)
 
 ## Non-English podcasts
 
@@ -244,8 +341,11 @@ itself; it writes the file and wakes the scheduler, which starts within ~15 s.
 |---|---|
 | `ingest(url, name?, min_minutes?, language?)` | Subscribe to a URL (see below); detects non-English feeds |
 | `preview(url)` | Dry run: what `ingest` would add, with the latest episode titles |
-| `subscription_list()` / `subscription_remove(name)` | List or remove entries |
+| `subscription_list(include_completed_oneoffs?)` / `subscription_remove(name)` | List or remove entries (hides completed one-offs by default when `PODCAST_DIGEST_DATA_DIR` is mounted) |
 | `process_now()` | Run a tick now |
+| `digest_status(limit?)` | Read-only pipeline status: stage counts, recent deliveries, in-progress episodes, held deliveries, and feed errors |
+| `search_transcripts(query, feed?, limit?)` | Search saved summaries and transcripts by keyword(s) |
+| `get_episode(query_or_guid, include_transcript?, max_chars?, offset?)` | Read an episode's summary and paginated transcript (`.clean.md` preferred, `.txt` fallback) |
 
 | URL | Becomes |
 |---|---|
@@ -304,7 +404,7 @@ uv run podcast-digest serve            # the scheduler
 Models: `ggml-medium.en.bin` and friends from
 [huggingface.co/ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp).
 Without uv, install the bundled transcriber first:
-`pip install ./packages/local-transcriber '.[mcp]'`.
+`pip install -e ./packages/local-transcriber -e '.[mcp]'`.
 
 ## CLI
 
@@ -312,6 +412,9 @@ Without uv, install the bundled transcriber first:
 podcast-digest serve                            # long-running scheduler (the container default)
 podcast-digest run [--feed NAME] [--dry-run]    # one tick, then exit
 podcast-digest check-config [PATH]              # validate feeds.toml, no side effects
+podcast-digest delivery list                    # list saved delivery operations and outcomes
+podcast-digest delivery inspect OPERATION_ID    # show a saved delivery envelope and state
+podcast-digest delivery reconcile OPERATION_ID --graph-message-id MESSAGE_ID
 podcast-digest --version
 podcast-digest-mcp                              # the MCP server
 ```
@@ -340,8 +443,8 @@ The gate: frozen dependencies, Ruff, mypy, the whole pytest suite, and
 validation of the example `feeds.toml`. External services (feeds, CDNs,
 whisper, LLMs, mail, SSH, webhooks) are mocked; the integration tests replay the
 whole pipeline against a fixture feed and assert both what is sent and what is
-persisted. `packages/local-transcriber` is the reusable "local file → whisper.cpp
-→ timestamped transcript" part, with its own CLI (`local-transcribe`).
+persisted. `packages/local-transcriber` is the reusable local audio to timestamped
+transcript boundary, with its own Whisper CLI (`local-transcribe`).
 
 Images: `deploy/Dockerfile` builds the transcriber (`--target
 transcriber-runtime`) and the app (`--target podcast-runtime`);
@@ -357,3 +460,58 @@ Report security problems privately, as described in [SECURITY.md](SECURITY.md).
 ## License
 
 [MIT](LICENSE). Third-party notices: [NOTICE](NOTICE).
+
+Published runtime candidates carry OCI source, full revision and release version
+labels, and the image smoke verifies all three before promotion. When running
+`scripts/smoke-image.sh` directly, set `GITHUB_REPOSITORY` to the source repository
+whose artifact is being verified. This check performs no feed, mail or model work.
+
+Runtime identity is embedded before packaging, independently of environment or
+container labels. The worker (`podcast-digest`) and MCP service
+(`podcast-digest-mcp`) use the root distribution version; `local-transcriber`
+uses its own package version. Their log records include `service`, `version`,
+`source_revision` (the full revision) and an opaque process `instance`. Existing
+structured fields, redaction and log suppression remain in effect. Successful
+CLI stdout (including the transcription artifact) stays unchanged. The MCP
+initialize response reports the installed product version.
+
+Each digest email ends with `Generated by podcast-digest <version>, source
+revision <full revision|unknown>.` This identifies the worker build that authored
+the stored summary. Its identity is saved in the nullable `episodes.summary_build`
+column together with `summary_html`. A later build retrying delivery retains that
+identity. Summaries stored before this column was added keep NULL and are sent
+without an invented provenance line.
+
+The delivery-time wrapper supplies the title, episode metadata, listening link
+and transcript-source note. They are frozen with the first delivery intent;
+retries reuse that saved envelope and its attachments. They are outside the
+summary producer's identity. The email footer does not name
+a separate delivery build. The stored summary and webhook `summary` contain no
+build footer.
+
+Image builds require `VERSION` and `VCS_REF` (40 or 64 hexadecimal characters).
+`deploy/Dockerfile`'s `transcriber-runtime` target takes the transcriber product
+`VERSION`; its alternate `podcast-runtime` target instead takes the root `VERSION`
+and a separate `TRANSCRIBER_VERSION`. The MCP Dockerfile also requires both
+product versions. The derived podcast Dockerfile stamps only the root product,
+retaining the transcriber stamp from its input digest. Invalid or conflicting
+inputs fail before installation. The three image tags and OCI version labels
+continue to use the root release-wave version.
+
+Noneditable wheels and sdists built from a clean Git checkout embed that
+commit through the package's
+`hatch_build.py`. A wheel built from an sdist keeps the stamp the sdist ships.
+Uncommitted changes and index-hidden inputs (sparse checkouts, skip-worktree or
+assume-unchanged) are refused. Without Git metadata, as in the Docker build
+contexts, first run `python3 scripts/embed-build-identity.py podcast-digest
+"$VERSION" "$VCS_REF"`, or `local-transcriber` with its own `VERSION`; a build
+with no stamp is refused. Generated manifests are excluded from Git and Docker
+build contexts. A missing stamp is allowed only in an uninstalled source tree or
+an explicitly editable install, where the revision is `unknown`; a noneditable
+installed package with a missing or invalid stamp fails closed. The transcriber
+images still export `LOCAL_TRANSCRIBER_SOURCE_REV` with the same revision for
+downstream pin checks; it never changes the installed identity.
+
+The exact-image smoke accepts `variant image full-revision image-release-version
+transcriber-product-version`. It checks the actual installed stamps and the MCP
+initialize version, without invoking providers, downloading models or transcribing.

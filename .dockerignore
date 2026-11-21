@@ -12,3 +12,6 @@ data
 output
 *.log
 config
+
+# Generated only from validated packaging inputs.
+**/build_identity.json

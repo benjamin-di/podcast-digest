@@ -11,16 +11,19 @@ excluded from the pending queue until manually cleared.
 """
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
 
 from .dedupe import ContentCandidate, TranscriptFingerprint
+from .identity import BuildIdentity
 from .sanitize import sanitize_summary_html
 
 logger = logging.getLogger(__name__)
@@ -116,6 +119,7 @@ CREATE TABLE IF NOT EXISTS episodes (
     transcript_path TEXT,
     segments_path TEXT,
     summary_html TEXT,
+    summary_build TEXT,
     content_sha256 TEXT,
     content_minhash TEXT,
     content_token_count INTEGER,
@@ -132,6 +136,30 @@ CREATE TABLE IF NOT EXISTS episodes (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (feed_url, guid)
+);
+
+-- A committed unknown intent precedes any attempt at external submission.
+-- The envelope and target are immutable across retries; only a proven rejection
+-- can return an operation to not_submitted. Receipt and episode finish together.
+CREATE TABLE IF NOT EXISTS digest_deliveries (
+    operation_id TEXT PRIMARY KEY,
+    feed_url TEXT NOT NULL,
+    guid TEXT NOT NULL,
+    target TEXT NOT NULL,
+    envelope TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('unknown', 'not_submitted', 'accepted')),
+    attempts INTEGER NOT NULL DEFAULT 1,
+    receipt TEXT,
+    last_error TEXT,
+    suppression_reason TEXT,
+    show TEXT NOT NULL DEFAULT '',
+    finalized_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (feed_url, guid),
+    CHECK ((state = 'accepted') = (receipt IS NOT NULL)),
+    FOREIGN KEY (feed_url, guid) REFERENCES episodes(feed_url, guid)
+        ON UPDATE CASCADE ON DELETE RESTRICT
 );
 
 -- Small key/value store for instance-level state (e.g. when the delivery
@@ -173,6 +201,7 @@ class EpisodeRow:
     failed_at: str | None
     emailed_at: str | None
     wiki_pushed_at: str | None
+    summary_build: BuildIdentity | None = None
 
     @classmethod
     def from_row(cls, r: sqlite3.Row) -> EpisodeRow:
@@ -200,7 +229,29 @@ class EpisodeRow:
             failed_at=r["failed_at"],
             emailed_at=r["emailed_at"],
             wiki_pushed_at=r["wiki_pushed_at"],
+            summary_build=(
+                BuildIdentity(**json.loads(r["summary_build"]))
+                if r["summary_build"] else None
+            ),
         )
+
+
+@dataclass(frozen=True)
+class DeliveryRow:
+    operation_id: str
+    feed_url: str
+    guid: str
+    target: str
+    envelope: str
+    state: str
+    attempts: int
+    receipt: str | None
+    last_error: str | None
+    suppression_reason: str | None
+    show: str
+    finalized_at: str | None
+    created_at: str
+    updated_at: str
 
 
 def _now() -> str:
@@ -216,6 +267,7 @@ class Database:
         self._conn = sqlite3.connect(path, isolation_level=None)  # autocommit
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
         self._migrate()
@@ -227,6 +279,16 @@ class Database:
         columns need an explicit ALTER. Cheap to run on every boot; a no-op once
         the column exists.
         """
+        delivery_columns = {
+            r["name"] for r in self._conn.execute("PRAGMA table_info(digest_deliveries)")
+        }
+        for name, declaration in (
+            ("suppression_reason", "TEXT"),
+            ("show", "TEXT NOT NULL DEFAULT ''"),
+            ("finalized_at", "TEXT"),
+        ):
+            if name not in delivery_columns:
+                self._conn.execute(f"ALTER TABLE digest_deliveries ADD COLUMN {name} {declaration}")
         have = {r["name"] for r in self._conn.execute("PRAGMA table_info(episodes)")}
         if "clean_attempts" not in have:
             self._conn.execute(
@@ -304,6 +366,27 @@ class Database:
                 "UPDATE episodes SET wiki_pushed_at=? WHERE status='emailed'",
                 (_now(),),
             )
+        if "summary_build" not in have:
+            self._conn.execute("ALTER TABLE episodes ADD COLUMN summary_build TEXT")
+        self._prune_finalized_delivery_attachments()
+
+    def _prune_finalized_delivery_attachments(self) -> None:
+        """Drop duplicate base64 attachment payloads from finalized accepted deliveries."""
+        rows = self._conn.execute(
+            "SELECT operation_id, envelope FROM digest_deliveries "
+            "WHERE state='accepted' AND finalized_at IS NOT NULL "
+            "AND envelope LIKE '%\"content\":%'"
+        ).fetchall()
+        if not rows:
+            return
+        with self.tx():
+            for row in rows:
+                pruned = _prune_envelope_attachments(row["envelope"])
+                if pruned != row["envelope"]:
+                    self._conn.execute(
+                        "UPDATE digest_deliveries SET envelope=? WHERE operation_id=?",
+                        (pruned, row["operation_id"]),
+                    )
 
     def close(self) -> None:
         self._conn.close()
@@ -315,8 +398,9 @@ class Database:
         try:
             yield self._conn
             self._conn.execute("COMMIT")
-        except Exception:
-            self._conn.execute("ROLLBACK")
+        except BaseException:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
             raise
 
     # ---- feeds ---------------------------------------------------------
@@ -438,6 +522,27 @@ class Database:
         row = cur.fetchone()
         return EpisodeRow.from_row(row) if row else None
 
+    def refresh_pending_episode_media(
+        self,
+        *,
+        feed_url: str,
+        guid: str,
+        audio_url: str,
+        duration_seconds: int | None = None,
+    ) -> bool:
+        """Refresh rotating enclosure URLs and missing durations before transcription."""
+        cur = self._conn.execute(
+            """
+            UPDATE episodes
+            SET audio_url=?, duration_seconds=COALESCE(?, duration_seconds), updated_at=?
+            WHERE feed_url=? AND guid=?
+              AND status IN ('discovered', 'downloaded')
+              AND (audio_url != ? OR (duration_seconds IS NULL AND ? IS NOT NULL))
+            """,
+            (audio_url, duration_seconds, _now(), feed_url, guid, audio_url, duration_seconds),
+        )
+        return cur.rowcount == 1
+
     def migrate_legacy_synthetic_guid(
         self,
         *,
@@ -504,6 +609,7 @@ class Database:
         transcript_path: str | None = None,
         segments_path: str | None = None,
         summary_html: str | None = None,
+        summary_build: BuildIdentity | None = None,
         emailed_at: str | None = None,
         terminal_reason: str | None = None,
     ) -> None:
@@ -527,17 +633,31 @@ class Database:
             cols.append("segments_path=?"); vals.append(segments_path)
         if summary_html is not None:
             cols.append("summary_html=?"); vals.append(summary_html)
+            cols.append("summary_build=?")
+            vals.append(json.dumps(asdict(summary_build)) if summary_build else None)
+        elif summary_build is not None:
+            raise ValueError("summary_build requires summary_html")
         if emailed_at is not None:
             cols.append("emailed_at=?"); vals.append(emailed_at)
         if terminal_reason is not None:
             if status != "emailed":
                 raise ValueError("terminal_reason requires status='emailed'")
             cols.append("terminal_reason=?"); vals.append(terminal_reason)
-        vals.extend([feed_url, guid])
-        self._conn.execute(
-            f"UPDATE episodes SET {', '.join(cols)} WHERE feed_url=? AND guid=?",
-            vals,
+        allowed = STAGES[:_STAGE_IDX[status] + 1]
+        placeholders = ",".join("?" for _ in allowed)
+        vals.extend([feed_url, guid, *allowed, status])
+        cur = self._conn.execute(
+            f"UPDATE episodes SET {', '.join(cols)} WHERE feed_url=? AND guid=? "
+            f"AND status IN ({placeholders}) "
+            "AND (? != 'emailed' OR NOT EXISTS ("
+            "SELECT 1 FROM digest_deliveries d WHERE d.feed_url=episodes.feed_url "
+            "AND d.guid=episodes.guid AND d.state != 'accepted' "
+            "AND NOT (d.state='not_submitted' AND d.suppression_reason IS NOT NULL "
+            "AND d.suppression_reason IS ?)))",
+            [*vals, terminal_reason],
         )
+        if cur.rowcount != 1:
+            raise ValueError("missing episode, backward stage, or unresolved delivery")
 
     def clear_audio_path(self, feed_url: str, guid: str) -> None:
         self._conn.execute(
@@ -669,6 +789,127 @@ class Database:
             "WHERE feed_url=? AND guid=?",
             (_now(), feed_url, guid),
         )
+
+    # ---- digest delivery ----------------------------------------------
+
+    def get_delivery(self, feed_url: str, guid: str) -> DeliveryRow | None:
+        row = self._conn.execute(
+            "SELECT * FROM digest_deliveries WHERE feed_url=? AND guid=?",
+            (feed_url, guid),
+        ).fetchone()
+        return DeliveryRow(**dict(row)) if row else None
+
+    def delivery_by_id(self, operation_id: str) -> DeliveryRow | None:
+        row = self._conn.execute(
+            "SELECT * FROM digest_deliveries WHERE operation_id=?", (operation_id,),
+        ).fetchone()
+        return DeliveryRow(**dict(row)) if row else None
+
+    def deliveries(self) -> list[DeliveryRow]:
+        return [DeliveryRow(**dict(row)) for row in self._conn.execute(
+            "SELECT * FROM digest_deliveries ORDER BY created_at, operation_id",
+        )]
+
+    def claim_delivery(
+        self, feed_url: str, guid: str, *, target: str, envelope: str, show: str = "",
+    ) -> DeliveryRow | None:
+        """Claim a first send or proven non-submission under the tick lock.
+
+        A restart cannot distinguish a crash immediately before I/O from one
+        after acceptance. Both retain unknown; no timeout releases this fence.
+        """
+        with self.tx():
+            current = self.get_delivery(feed_url, guid)
+            if current is None:
+                ep = self.get_episode(feed_url, guid)
+                if ep is None or ep.status != "summarized":
+                    raise ValueError("delivery requires a summarized episode")
+                now = _now()
+                self._conn.execute(
+                    "INSERT INTO digest_deliveries "
+                    "(operation_id, feed_url, guid, target, envelope, show, state, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'unknown', ?, ?)",
+                    (uuid4().hex, feed_url, guid, target, envelope, show, now, now),
+                )
+            else:
+                if current.target != target:
+                    raise ValueError("delivery target changed; inspect the saved operation")
+                if current.state != "not_submitted" or current.suppression_reason is not None:
+                    return None
+                self._conn.execute(
+                    "UPDATE digest_deliveries SET state='unknown', attempts=attempts+1, "
+                    "last_error=NULL, updated_at=? WHERE operation_id=? AND state='not_submitted'",
+                    (_now(), current.operation_id),
+                )
+            claimed = self.get_delivery(feed_url, guid)
+        return claimed
+
+    def delivery_not_submitted(self, operation_id: str, error: str) -> None:
+        cur = self._conn.execute(
+            "UPDATE digest_deliveries SET state='not_submitted', last_error=?, updated_at=? "
+            "WHERE operation_id=? AND state='unknown'",
+            (error, _now(), operation_id),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("delivery is not awaiting a submission verdict")
+
+    def suppress_delivery(self, operation_id: str, reason: str) -> None:
+        """Positive duplicate evidence closes only a proven non-submission."""
+        if reason not in {"duplicate_identity", "duplicate_transcript_exact", "duplicate_transcript_near"}:
+            raise ValueError("unsupported delivery suppression reason")
+        with self.tx():
+            delivery = self.delivery_by_id(operation_id)
+            if delivery is None or delivery.state != "not_submitted":
+                raise ValueError("only a proven non-submission can be suppressed")
+            self._conn.execute(
+                "UPDATE digest_deliveries SET suppression_reason=?, updated_at=? WHERE operation_id=?",
+                (reason, _now(), operation_id),
+            )
+            self.set_status(feed_url=delivery.feed_url, guid=delivery.guid,
+                            status="emailed", terminal_reason=reason)
+
+    def deliveries_pending_finalization(self) -> list[DeliveryRow]:
+        return [DeliveryRow(**dict(row)) for row in self._conn.execute(
+            "SELECT * FROM digest_deliveries WHERE state='accepted' AND finalized_at IS NULL "
+            "ORDER BY created_at, operation_id",
+        )]
+
+    def finalize_delivery(self, operation_id: str) -> None:
+        row = self._conn.execute(
+            "SELECT envelope FROM digest_deliveries WHERE operation_id=? AND state='accepted'",
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            return
+        pruned = _prune_envelope_attachments(row["envelope"])
+        self._conn.execute(
+            "UPDATE digest_deliveries SET finalized_at=?, envelope=? "
+            "WHERE operation_id=? AND state='accepted'",
+            (_now(), pruned, operation_id),
+        )
+
+    def complete_delivery(self, operation_id: str, receipt: str) -> None:
+        """Record positive acceptance evidence and the business watermark atomically."""
+        if not receipt.strip():
+            raise ValueError("a positive receipt is required")
+        with self.tx():
+            delivery = self.delivery_by_id(operation_id)
+            if delivery is None:
+                raise ValueError("unknown delivery operation")
+            if delivery.state == "accepted":
+                return
+            if delivery.state != "unknown":
+                raise ValueError("delivery has no outstanding submission")
+            now = _now()
+            self._conn.execute(
+                "UPDATE digest_deliveries SET state='accepted', receipt=?, last_error=NULL, "
+                "updated_at=? WHERE operation_id=? AND state='unknown'",
+                (receipt, now, operation_id),
+            )
+            self.set_status(
+                feed_url=delivery.feed_url, guid=delivery.guid, status="emailed",
+                emailed_at=now, terminal_reason="sent",
+            )
 
     # ---- wiki push (post-email, non-fatal) -----------------------------
 
@@ -817,6 +1058,40 @@ class Database:
             )
             self._conn.execute("DELETE FROM feeds WHERE url=?", (old_url,))
         return migrated
+
+
+def _prune_envelope_attachments(raw: str) -> str:
+    """Replace base64 attachment bodies with size metadata once delivery is finalized."""
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return raw
+    if not isinstance(data, dict):
+        return raw
+    attachments = data.get("attachments")
+    if not isinstance(attachments, list) or not attachments:
+        return raw
+    changed = False
+    pruned_attachments = []
+    for item in attachments:
+        if isinstance(item, dict) and "content" in item:
+            encoded = item["content"]
+            size_bytes = len(encoded) * 3 // 4 if isinstance(encoded, str) else 0
+            if isinstance(encoded, str):
+                size_bytes -= encoded.rstrip().count("=")
+            pruned_attachments.append({
+                "name": item.get("name", ""),
+                "content_type": item.get("content_type", "application/octet-stream"),
+                "size_bytes": max(0, size_bytes),
+                "pruned": True,
+            })
+            changed = True
+        else:
+            pruned_attachments.append(item)
+    if not changed:
+        return raw
+    data["attachments"] = pruned_attachments
+    return json.dumps(data, sort_keys=True)
 
 
 def _url_without_query(url: str) -> str:

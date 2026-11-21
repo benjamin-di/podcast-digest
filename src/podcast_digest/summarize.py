@@ -242,7 +242,16 @@ def _language_guidance(lang: str, style: Style = "general") -> str:
     (LLMs frequently fumble those, producing order-of-magnitude errors in the
     takeaways) and, for the finance style, China-specific market jargon.
     """
-    if lang == "zh":
+    if lang in ("zh", "yue"):
+        variety = "Cantonese Chinese" if lang == "yue" else "Mandarin Chinese"
+        romanization = (
+            "Romanize Chinese names/places with the characters in parentheses on first mention. "
+            if lang == "yue"
+            else (
+                "Romanize Chinese names/places in pinyin with the characters in parentheses "
+                "on first mention (e.g. Pan Gongsheng (潘功胜)). "
+            )
+        )
         jargon = (
             "In the Jargon section decode China-specific terms (PBOC, LPR, RRR, "
             "MLF, LGFV, A-/H-shares, SOE, Two Sessions). "
@@ -250,11 +259,10 @@ def _language_guidance(lang: str, style: Style = "general") -> str:
             else "In the Jargon section decode China-specific terms. "
         )
         return (
-            "The transcript is Mandarin Chinese. Write the ENTIRE summary in English. "
-            "Romanize Chinese names/places in pinyin with the characters in parentheses "
-            "on first mention (e.g. Pan Gongsheng (潘功胜)). "
+            f"The transcript is {variety}. Write the ENTIRE summary in English. "
+            + romanization
             + jargon
-            + "Convert Chinese numeric units correctly: 万 = 10^4, 亿 = 10^8."
+            + "Convert Chinese numeric units correctly: 万 = 10^4, 亿 = 10^8 (萬/億 in Traditional)."
         )
     names = "names/tickers" if style == "finance" else "names"
     return (
@@ -353,18 +361,38 @@ You receive ONE CHUNK of a longer transcript, with `[hh:mm:ss]` timestamps. Clea
 Output ONLY the cleaned Markdown for this chunk — no preamble, no document title, no "here is…", no code fences. Return it directly as your reply text; never write it to a file or reply with a file path or status note. It will be concatenated with the other chunks."""
 
 
+def _weighted_len(text: str) -> int:
+    """Approximate token-normalized length so dense non-ASCII scripts (e.g. CJK)
+    stay comfortably inside the cleanup output token budget."""
+    return sum(1 if ord(ch) < 128 else 3 for ch in text)
+
+
 def _chunk_transcript(
     segments: list[Segment], fallback_text: str, *, max_chars: int,
 ) -> list[str]:
-    """Split the timestamped transcript into ~max_chars chunks at segment
+    """Split the timestamped transcript into ~max_chars weighted chunks at segment
     boundaries so each cleanup call fits a single model response."""
     if not segments:
         text = fallback_text.strip()
         if not text:
             return []
-        return [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
+        if _weighted_len(text) <= max_chars:
+            return [text]
+        chunks: list[str] = []
+        buf: list[str] = []
+        buf_weight = 0
+        for ch in text:
+            w = 1 if ord(ch) < 128 else 3
+            if buf_weight + w > max_chars and buf:
+                chunks.append("".join(buf))
+                buf, buf_weight = [], 0
+            buf.append(ch)
+            buf_weight += w
+        if buf:
+            chunks.append("".join(buf))
+        return chunks
 
-    chunks: list[str] = []
+    chunks = []
     cur: list[str] = []
     cur_len = 0
     last_stamp = -1e9
@@ -375,11 +403,12 @@ def _chunk_transcript(
             piece += f"\n[{_fmt_hms(seg.start)}] "
             last_stamp = seg.start
         piece += seg.text.strip() + " "
-        if cur_len + len(piece) > max_chars and cur:
+        piece_weight = _weighted_len(piece)
+        if cur_len + piece_weight > max_chars and cur:
             chunks.append("".join(cur).strip())
             cur, cur_len, last_stamp = [], 0, -1e9
         cur.append(piece)
-        cur_len += len(piece)
+        cur_len += piece_weight
     if cur:
         chunks.append("".join(cur).strip())
     return chunks

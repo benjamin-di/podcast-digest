@@ -1,18 +1,11 @@
-"""Graph sendMail POST classification: the transmit/response phase split.
-
-Graph sendMail is not idempotent, so _post's job is to classify every failure
-into exactly one of: retryable (nothing accepted — MailError) or ambiguous
-(request fully out, verdict unreadable — MailProbablyDelivered, which the
-pipeline treats as sent to avoid duplicate digests). These tests fake
-http.client.HTTPSConnection to pin each classification.
-"""
+"""Graph transport certainty: only proven non-submission permits retry."""
 from __future__ import annotations
 
 import http.client
 
 import pytest
 
-from podcast_digest.mail import GraphMailer, MailError, MailProbablyDelivered
+from podcast_digest.mail import GraphMailer, MailError, MailOutcomeUnknown
 
 
 class _FakeResp:
@@ -30,12 +23,17 @@ class _FakeResp:
 class _FakeConn:
     """Stands in for HTTPSConnection; behavior injected per test."""
 
+    connect_exc = None
     request_exc = None
     getresponse_exc = None
     resp = None
 
     def __init__(self, netloc, timeout=None):
         pass
+
+    def connect(self):
+        if type(self).connect_exc:
+            raise type(self).connect_exc
 
     def request(self, method, path, body=None, headers=None):
         if type(self).request_exc:
@@ -58,6 +56,7 @@ def mailer(monkeypatch):
     m._token_expiry = 2**62
     monkeypatch.setattr(http.client, "HTTPSConnection", _FakeConn)
     # Reset class-level injection between tests.
+    _FakeConn.connect_exc = None
     _FakeConn.request_exc = None
     _FakeConn.getresponse_exc = None
     _FakeConn.resp = _FakeResp()
@@ -68,46 +67,74 @@ def test_post_202_succeeds(mailer):
     mailer._post("/users/bot@x/sendMail", {"k": "v"})  # no raise
 
 
-def test_transmit_timeout_is_retryable(mailer):
-    # Failure before/while the body goes out: Graph accepted nothing → retry.
-    _FakeConn.request_exc = TimeoutError("send buffer stalled")
+def test_connect_failure_proves_non_submission(mailer):
+    _FakeConn.connect_exc = TimeoutError("connect stalled")
     with pytest.raises(MailError):
         mailer._post("/p", {})
 
 
-def test_response_timeout_is_probably_delivered(mailer):
-    _FakeConn.getresponse_exc = TimeoutError("no status line")
-    with pytest.raises(MailProbablyDelivered):
+@pytest.mark.parametrize("exc", [TimeoutError(), ConnectionResetError(), BrokenPipeError(),
+                                 http.client.RemoteDisconnected()])
+def test_request_socket_error_is_unknown_even_if_sendall_raises(mailer, exc):
+    _FakeConn.request_exc = exc
+    with pytest.raises(MailOutcomeUnknown):
         mailer._post("/p", {})
 
 
-def test_garbled_response_is_probably_delivered(mailer):
+def test_response_timeout_is_unknown(mailer):
+    _FakeConn.getresponse_exc = TimeoutError("no status line")
+    with pytest.raises(MailOutcomeUnknown):
+        mailer._post("/p", {})
+
+
+def test_garbled_response_is_unknown(mailer):
     # BadStatusLine is an HTTPException, NOT an OSError — it must land in the
     # same ambiguous bucket as a response timeout, not escape uncategorized
     # (which would re-send and bring back the duplicate storm).
     _FakeConn.getresponse_exc = http.client.BadStatusLine("garbage")
-    with pytest.raises(MailProbablyDelivered):
+    with pytest.raises(MailOutcomeUnknown):
         mailer._post("/p", {})
 
 
-def test_remote_disconnected_is_retryable(mailer):
-    # Zero response bytes = Graph never started a reply → treat as rejected.
-    _FakeConn.getresponse_exc = http.client.RemoteDisconnected("closed")
-    with pytest.raises(MailError):
+@pytest.mark.parametrize("exc", [http.client.RemoteDisconnected("closed"),
+                                 ConnectionResetError("reset"), OSError("socket closed")])
+def test_response_socket_closure_is_unknown(mailer, exc):
+    _FakeConn.getresponse_exc = exc
+    with pytest.raises(MailOutcomeUnknown):
         mailer._post("/p", {})
 
 
-def test_error_status_with_stalled_body_is_still_a_failure(mailer):
-    # Status line received and it's a 500: the outcome is DEFINITIVE even if
-    # reading the error body times out — this must be a retryable MailError,
-    # never probably-delivered (marking a provably-failed send as emailed
-    # would silently lose the digest).
-    _FakeConn.resp = _FakeResp(status=500, read_exc=TimeoutError("body stalled"))
-    with pytest.raises(MailError, match="HTTP 500"):
+@pytest.mark.parametrize("status", [408, 500, 502, 503, 504, 200, 302])
+def test_unproven_status_is_unknown_even_when_body_stalls(mailer, status):
+    _FakeConn.resp = _FakeResp(status=status, read_exc=TimeoutError("body stalled"))
+    with pytest.raises(MailOutcomeUnknown, match=f"HTTP {status}"):
         mailer._post("/p", {})
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 405, 413, 415, 422, 429])
+def test_explicit_rejection_proves_non_submission(mailer, status):
+    _FakeConn.resp = _FakeResp(status=status, read_exc=TimeoutError("body stalled"))
+    with pytest.raises(MailError, match=f"HTTP {status}"):
+        mailer._post("/p", {})
+
+
+def test_202_with_unreadable_body_still_proves_acceptance(mailer):
+    _FakeConn.resp = _FakeResp(read_exc=TimeoutError("body stalled"))
+    mailer._post("/p", {})
 
 
 def test_error_status_includes_body_detail(mailer):
     _FakeConn.resp = _FakeResp(status=429, body=b'{"error":"throttled"}')
     with pytest.raises(MailError, match="throttled"):
         mailer._post("/p", {})
+
+
+def test_operation_header_is_correlation_and_sent_copy_is_requested(mailer, monkeypatch):
+    captured = []
+    monkeypatch.setattr(mailer, "_post", lambda path, body: captured.append(body))
+    mailer.send(to="reader@example.com", subject="Synthetic digest", body_html="<p>x</p>",
+                operation_id="a" * 32)
+    assert captured[0]["saveToSentItems"] is True
+    assert captured[0]["message"]["internetMessageHeaders"] == [
+        {"name": "x-podcast-digest-operation", "value": "a" * 32},
+    ]

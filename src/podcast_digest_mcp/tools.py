@@ -27,7 +27,7 @@ from podcast_digest.youtube import (
     single_video_episode,
 )
 
-from . import apple, feeds_io, lang, routing
+from . import apple, archive, feeds_io, lang, routing
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +41,9 @@ def register(
     feeds_path: Path,
     http: httpx.AsyncClient,
     http_sync: httpx.Client,
+    data_dir: Path | None = None,
 ) -> None:
-    """Wire the four tools onto the FastMCP app."""
+    """Wire the MCP tools onto the FastMCP app."""
 
     # -- ingest -----------------------------------------------------------
 
@@ -285,25 +286,40 @@ def register(
     # -- subscription_list ------------------------------------------------
 
     @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
-    async def subscription_list() -> dict:
-        """Read feeds.toml and return every entry with its source kind and type.
+    async def subscription_list(include_completed_oneoffs: bool = False) -> dict:
+        """Read feeds.toml and return entries with their source kind and type.
 
         feeds.toml holds two kinds of entry, distinguished by `type`:
         * `subscription` — recurring (`rss_url` / `search` / `youtube`); the
           newest episode is picked up every poll tick, indefinitely.
         * `oneoff` — a single episode (`youtube_video` / `audio_url`); processed
-          exactly once, then deduped. Its entry lingers as a record of what was
-          ingested; use `subscription_remove(name)` to drop it.
+          exactly once, then deduped. Completed one-offs are hidden by default
+          when state.db is available; pass `include_completed_oneoffs=True` to
+          include them.
         """
         doc = await asyncio.to_thread(feeds_io.read, feeds_path)
+        completed = (
+            set() if include_completed_oneoffs
+            else await asyncio.to_thread(archive.completed_oneoff_keys, data_dir)
+        )
         items = []
+        hidden_completed = 0
         for f in doc.feeds:
             source = _source_of(f)
+            value = getattr(f, source) if source else None
+            feed_type = _feed_type(source)
+            if (
+                feed_type == "oneoff"
+                and not include_completed_oneoffs
+                and archive.oneoff_is_completed(source, value, completed)
+            ):
+                hidden_completed += 1
+                continue
             items.append({
                 "name": f.name,
-                "type": _feed_type(source),
+                "type": feed_type,
                 "source": source,
-                "value": getattr(f, source) if source else None,
+                "value": value,
                 "min_minutes": f.min_minutes,
                 "language": f.language,
             })
@@ -311,12 +327,61 @@ def register(
             "subscriptions": sum(1 for it in items if it["type"] == "subscription"),
             "oneoffs": sum(1 for it in items if it["type"] == "oneoff"),
         }
+        if hidden_completed:
+            counts["completed_oneoffs_hidden"] = hidden_completed
         return {
             "recipient": doc.recipient,
             "poll_seconds": doc.poll_seconds,
             "counts": counts,
             "feeds": items,
         }
+
+    # -- digest_status ----------------------------------------------------
+
+    @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
+    async def digest_status(limit: int = 10) -> dict:
+        """Return read-only digest status: stage counts, recent deliveries,
+        in-progress episodes, held unknown deliveries, and feed errors."""
+        return await asyncio.to_thread(archive.digest_status, data_dir, limit=limit)
+
+    # -- search_transcripts -----------------------------------------------
+
+    @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
+    async def search_transcripts(
+        query: str,
+        feed: str | None = None,
+        limit: int = 10,
+    ) -> dict:
+        """Search saved podcast summaries and transcripts by keyword(s).
+
+        Returns matching episodes ranked by relevance with context snippets and
+        GUIDs that can be passed to `get_episode`.
+        """
+        return await asyncio.to_thread(
+            archive.search_transcripts, data_dir, query=query, feed=feed, limit=limit,
+        )
+
+    # -- get_episode ------------------------------------------------------
+
+    @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
+    async def get_episode(
+        query_or_guid: str,
+        include_transcript: bool = True,
+        max_chars: int = 40_000,
+        offset: int = 0,
+    ) -> dict:
+        """Read one episode's metadata, summary, and saved transcript (cleaned
+        Markdown preferred, raw text fallback). Use `offset` and `max_chars` to
+        paginate long transcripts.
+        """
+        return await asyncio.to_thread(
+            archive.get_episode,
+            data_dir,
+            query_or_guid=query_or_guid,
+            include_transcript=include_transcript,
+            max_chars=max_chars,
+            offset=offset,
+        )
 
     # -- subscription_remove ---------------------------------------------
 

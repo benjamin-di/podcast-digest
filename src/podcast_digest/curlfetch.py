@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from .net import validate_outbound_url_async
+from .net import ResolvedOutboundTarget, resolve_outbound_url_async
 from .proc import run_capture
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,17 @@ MAX_HOPS = 5
 
 class CurlFetchError(RuntimeError):
     """curl fetch failed: non-zero exit, malformed redirect, or too many hops."""
+
+
+def _curl_resolve_args(target: ResolvedOutboundTarget) -> list[str]:
+    """Pin validated public IP(s) for curl so DNS cannot rebind after validation."""
+    if target.is_ip_literal:
+        return []
+    pinned = ",".join(
+        f"[{address}]" if address.version == 6 else str(address)
+        for address in target.addresses
+    )
+    return ["--resolve", f"{target.host}:{target.port}:{pinned}"]
 
 
 async def fetch_to_file(
@@ -57,8 +68,10 @@ async def fetch_to_file(
     """
     hop_url = url
     for _ in range(MAX_HOPS):
+        target = await resolve_outbound_url_async(hop_url)
         rc, out, err = await run_capture(
             ["curl", "-fsS", "--max-time", max_time, "-A", user_agent,
+             *_curl_resolve_args(target),
              "-o", str(dest), "-w", "%{http_code}\t%{redirect_url}",
              "--", hop_url],
             timeout=timeout, label=label,
@@ -85,7 +98,7 @@ async def fetch_to_file(
             # The hop body is a redirect stub — drop it before following, or a
             # later failure could leave it behind masquerading as the payload.
             dest.unlink(missing_ok=True)
-            await validate_outbound_url_async(redirect_url)
+            await resolve_outbound_url_async(redirect_url)
             logger.info(
                 "%s: following redirect %d %s -> %s",
                 label, status, hop_url, redirect_url,

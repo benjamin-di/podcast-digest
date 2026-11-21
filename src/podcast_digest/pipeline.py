@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import logging
 import os
+import re
 import tempfile
 import unicodedata
 from datetime import UTC, datetime, timedelta
@@ -23,6 +24,7 @@ from .db import (
     SUMMARIZE_TRANSPORT_MAX_ATTEMPTS,
     WIKI_PUSH_MAX_ATTEMPTS,
     Database,
+    DeliveryRow,
     EpisodeRow,
     stage_lt,
 )
@@ -32,6 +34,7 @@ from .dedupe import (
     find_content_match,
     fingerprint_transcript,
 )
+from .delivery import DeliveryHeld, Envelope, send_digest
 from .emitted import EmittedLog
 from .feeds import (
     SYNTHETIC_GUID_PREFIX,
@@ -41,10 +44,11 @@ from .feeds import (
     parse_episodes,
     resolve_feed_url,
 )
+from .identity import BUILD, BuildIdentity
 from .llm import SummarizerUnavailable, build_completer
 from .log import err_fields, event
-from .mail import MailAttachment, Mailer, MailProbablyDelivered
-from .net import validate_async_request
+from .mail import MailAttachment, Mailer
+from .net import build_async_client
 from .sanitize import safe_listen_url, sanitize_summary_html
 from .summarize import SummarizationInput, clean_transcript, summarize
 from .transcribe import Transcript, load_whisper_json, transcribe
@@ -159,11 +163,12 @@ async def _run_tick_locked(
     # as seen, so this one never re-sends them. Disabled (no-op) unless
     # PODCAST_DIGEST_EMITTED_LOG is set. See emitted.py.
     emitted = EmittedLog.load(settings.PODCAST_DIGEST_EMITTED_LOG)
-    async with httpx.AsyncClient(
+    if not dry_run:
+        finalize_deliveries(db, emitted)
+    async with build_async_client(
         timeout=httpx.Timeout(30.0, connect=10.0),
         follow_redirects=True,
         headers={"User-Agent": USER_AGENT},
-        event_hooks={"request": [validate_async_request]},
     ) as client:
         for feed in feeds_file.feeds:
             if only_feed and feed.name != only_feed:
@@ -174,6 +179,7 @@ async def _run_tick_locked(
                     feed=feed,
                     recipient=feeds_file.recipient,
                     min_minutes=feeds_file.min_minutes_for(feed),
+                    max_new_per_tick=feeds_file.max_new_per_tick_for(feed),
                     settings=settings,
                     db=db,
                     mailer=mailer,
@@ -209,6 +215,7 @@ async def _process_feed(
     feed: Feed,
     recipient: str,
     min_minutes: int,
+    max_new_per_tick: int = MAX_NEW_PER_TICK,
     settings: Settings,
     db: Database,
     mailer: Mailer | None,
@@ -222,7 +229,12 @@ async def _process_feed(
     emitted = emitted or EmittedLog(None)
     try:
         identity_url, itunes_id, episodes = await _discover_episodes(
-            feed=feed, min_minutes=min_minutes, settings=settings, db=db, client=client,
+            feed=feed,
+            min_minutes=min_minutes,
+            max_new_per_tick=max_new_per_tick,
+            settings=settings,
+            db=db,
+            client=client,
         )
     except Exception as discovery_error:  # noqa: BLE001
         known_identity = _known_feed_identity(feed, db)
@@ -283,6 +295,13 @@ async def _process_feed(
     new_episodes: list[EpisodeMeta] = []
     for episode in episodes:
         if db.has_episode(rss_url, episode.guid):
+            if episode.audio_url:
+                db.refresh_pending_episode_media(
+                    feed_url=rss_url,
+                    guid=episode.guid,
+                    audio_url=episode.audio_url,
+                    duration_seconds=episode.duration_seconds,
+                )
             continue
         if emitted.contains(
             rss_url, episode.guid, feed.display_show, episode.title,
@@ -307,7 +326,7 @@ async def _process_feed(
     #   - and even if `first_run` is wrong (old data / version skew / a restart
     #     mid-first-run left the archive unseen with last_polled_at set), the cap
     #     still bounds it — no unbounded flood.
-    cap = 1 if first_run else MAX_NEW_PER_TICK
+    cap = 1 if first_run else max_new_per_tick
     to_process = new_episodes[:cap]
     to_suppress = new_episodes[cap:]
 
@@ -393,7 +412,8 @@ async def _resume_pending_episodes(
         # If another instance already emailed this (per the shared delivery log),
         # suppress it — mark emailed without sending — so a stale in-progress row
         # from this instance's own DB (e.g. an old checkpoint) can't duplicate.
-        if emitted.contains(rss_url, ep.guid, feed.display_show, ep.title):
+        delivery = db.get_delivery(rss_url, ep.guid)
+        if delivery is None and emitted.contains(rss_url, ep.guid, feed.display_show, ep.title):
             db.set_status(
                 feed_url=rss_url, guid=ep.guid, status="emailed",
                 terminal_reason="duplicate_identity",
@@ -453,6 +473,12 @@ async def _resume_pending_episodes(
             # pending queue for good: GC its download artifacts (final audio
             # AND resume fragments like yt-dlp .part files) so dropped
             # episodes can't accumulate hundreds of MB each on the data volume.
+            delivery = db.get_delivery(rss_url, ep.guid)
+            if delivery is not None and delivery.state == "unknown":
+                # Neither episode retry budgets nor artifact GC can resolve an
+                # external effect. Preserve its high watermark and evidence.
+                logger.warning("%s", DeliveryHeld(delivery.operation_id))
+                continue
             exhausted = db.mark_failed(
                 rss_url, ep.guid, f"{type(e).__name__}: {e}", transport=is_transport,
             )
@@ -572,6 +598,7 @@ async def _discover_episodes(
     *,
     feed: Feed,
     min_minutes: int,
+    max_new_per_tick: int = MAX_NEW_PER_TICK,
     settings: Settings,
     db: Database,
     client: httpx.AsyncClient,
@@ -643,7 +670,7 @@ async def _discover_episodes(
             fetch=lambda url: youtube.list_channel_uploads(url, cookies=cookies),
         )
         episodes = await _enrich_new_youtube(
-            episodes, feed_url=feed_url, db=db, cookies=cookies,
+            episodes, feed_url=feed_url, db=db, cookies=cookies, limit=max_new_per_tick,
         )
         return feed_url, None, episodes
 
@@ -742,6 +769,44 @@ async def _advance_episode(
 ) -> bool:
     """Advance one episode through the pipeline. Returns True if we emailed."""
     emitted = emitted or EmittedLog(None)
+    # Unknown sends remain held. A proven non-submission retains its frozen
+    # payload, but positive delivery evidence can make retrying unnecessary.
+    existing_delivery = db.get_delivery(ep.feed_url, ep.guid)
+    if existing_delivery is not None:
+        if dry_run:
+            logger.info("mail.dry_run existing operation=%s state=%s",
+                        existing_delivery.operation_id, existing_delivery.state)
+            return False
+        if existing_delivery.state == "not_submitted":
+            reason = None
+            if emitted.contains(ep.feed_url, ep.guid, existing_delivery.show or feed.display_show, ep.title):
+                reason = "duplicate_identity"
+            else:
+                fingerprint = _load_or_create_content_fingerprint(
+                    ep=ep, transcript=None,
+                    transcript_path=Path(ep.transcript_path) if ep.transcript_path else None,
+                    db=db,
+                )
+                cutoff = datetime.now(UTC) - timedelta(days=CONTENT_WINDOW_DAYS)
+                candidates = db.delivered_content_since(cutoff.isoformat(timespec="seconds"))
+                candidates.extend(emitted.content_candidates(cutoff))
+                match = find_content_match(fingerprint, candidates) if fingerprint else None
+                if match is not None:
+                    reason = f"duplicate_transcript_{match.kind}"
+            if reason is not None:
+                db.suppress_delivery(existing_delivery.operation_id, reason)
+                if ep.audio_path:
+                    audio_cleanup(Path(ep.audio_path))
+                    if not Path(ep.audio_path).exists():
+                        db.clear_audio_path(ep.feed_url, ep.guid)
+                return False
+        if mailer is None:
+            raise RuntimeError("no mailer configured for a real tick")
+        sent = await send_digest(db, mailer, ep.feed_url, ep.guid)
+        if sent:
+            finalize_deliveries(db, emitted)
+        return sent
+
     feed_slug = _feed_storage_key(feed, ep.feed_url)
     safe_guid = _artifact_key(ep.guid)
 
@@ -752,15 +817,17 @@ async def _advance_episode(
     # the audio file is disposable — skip the (re-)download entirely for
     # episodes resuming at `transcribed` or later. This matters when we resume
     # after the email step failed: we'd otherwise re-fetch 80MB for nothing.
-    need_transcribe = stage_lt(ep.status, "transcribed") or not (
-        transcript_path and transcript_path.exists()
-        and segments_path and segments_path.exists()
+    need_transcribe = stage_lt(ep.status, "summarized") and (
+        stage_lt(ep.status, "transcribed") or not (
+            transcript_path and transcript_path.exists()
+            and segments_path and segments_path.exists()
+        )
     )
 
     # ---- 0. Publisher transcript. When the feed links a usable transcript
     # (Podcasting 2.0), it replaces download + local transcription. Anything
     # unusable — a fetch error, an unknown format, a transcript too short for
-    # the episode — falls through to whisper in this same pass, so it never
+    # the episode — falls through to local transcription in this same pass, so it never
     # costs a tick. Written in whisper's artifact shape, so every later stage
     # and every resume treats it like a whisper transcript.
     transcript: Transcript | None = None
@@ -810,7 +877,7 @@ async def _advance_episode(
                 )
             db.set_status(
                 feed_url=ep.feed_url, guid=ep.guid,
-                status="transcribed",
+                status="transcribed" if stage_lt(ep.status, "transcribed") else ep.status,
                 transcript_path=str(txt_path), segments_path=str(json_path),
             )
             transcript = pub.transcript
@@ -833,7 +900,8 @@ async def _advance_episode(
         )
         db.set_status(
             feed_url=ep.feed_url, guid=ep.guid,
-            status="downloaded", audio_path=str(audio_path),
+            status="downloaded" if stage_lt(ep.status, "downloaded") else ep.status,
+            audio_path=str(audio_path),
         )
 
     # ---- 1b. Length backstop. The declared feed duration is often missing or
@@ -869,10 +937,8 @@ async def _advance_episode(
                 f"transcribe needs audio but path is missing: {audio_path!r}"
             )
         transcript_dir = settings.transcripts_dir / feed_slug
-        # Non-English feeds (feeds.toml `language`) transcribe with the
-        # multilingual model in the original language; the summarizer then
-        # reads that transcript and emits English. English feeds keep the .en
-        # model + configured language, byte-for-byte as before.
+        # Transcribe in the feed's language. English can use Parakeet and
+        # Chinese can use Qwen, with the configured Whisper models as fallback.
         lang = feed.source_language
         whisper_model = (
             settings.PODCAST_DIGEST_WHISPER_MODEL_MULTILINGUAL if lang
@@ -886,12 +952,17 @@ async def _advance_episode(
             model_path=whisper_model,
             language=lang or settings.PODCAST_DIGEST_WHISPER_LANGUAGE,
             threads=settings.PODCAST_DIGEST_WHISPER_THREADS,
+            parakeet_model_dir=settings.PODCAST_DIGEST_PARAKEET_MODEL_DIR,
+            parakeet_worker_ssh_config=settings.PODCAST_DIGEST_PARAKEET_WORKER_SSH_CONFIG,
+            parakeet_threads=settings.PODCAST_DIGEST_PARAKEET_THREADS,
+            qwen_model_dir=settings.PODCAST_DIGEST_QWEN_MODEL_DIR,
+            qwen_threads=settings.PODCAST_DIGEST_QWEN_THREADS,
         )
         transcript_path = txt_path
         segments_path = json_path
         db.set_status(
             feed_url=ep.feed_url, guid=ep.guid,
-            status="transcribed",
+            status="transcribed" if stage_lt(ep.status, "transcribed") else ep.status,
             transcript_path=str(txt_path), segments_path=str(json_path),
         )
 
@@ -908,7 +979,9 @@ async def _advance_episode(
     cutoff = datetime.now(UTC) - timedelta(days=CONTENT_WINDOW_DAYS)
     candidates = db.delivered_content_since(cutoff.isoformat(timespec="seconds"))
     candidates.extend(emitted.content_candidates(cutoff))
-    content_match = find_content_match(content_fingerprint, candidates)
+    content_match = (
+        find_content_match(content_fingerprint, candidates) if content_fingerprint else None
+    )
     if content_match is not None:
         event(
             logger,
@@ -1038,6 +1111,7 @@ async def _advance_episode(
 
     # ---- 3b. Summarize (prefer the cleaned transcript when available)
     summary_html = ep.summary_html
+    summary_build = ep.summary_build
     if stage_lt(ep.status, "summarized") or not summary_html:
         if cleaned_md is not None:
             # The cleaned Markdown already carries speaker labels + [hh:mm:ss]
@@ -1087,9 +1161,11 @@ async def _advance_episode(
         summary_html = sanitize_summary_html(summary_html)
         if not summary_html.strip():
             raise RuntimeError("summary empty after sanitization")
+        summary_build = BUILD
         db.set_status(
             feed_url=ep.feed_url, guid=ep.guid,
             status="summarized", summary_html=summary_html,
+            summary_build=summary_build,
         )
         if stats is not None:
             stats["summarize_ok"] = stats.get("summarize_ok", 0) + 1
@@ -1117,56 +1193,59 @@ async def _advance_episode(
         else:
             if mailer is None:
                 raise RuntimeError("no mailer configured for a real (non-dry-run) tick")
-            try:
-                await asyncio.to_thread(
-                    mailer.send,
-                    to=recipient,
-                    subject=subject,
+            sent_now = await send_digest(
+                db, mailer, ep.feed_url, ep.guid,
+                Envelope(
+                    to=recipient, subject=subject,
                     body_html=_wrap_email(
                         summary_html, feed.display_show, ep.title, ep.audio_url,
                         published_at=ep.published_at,
                         duration_seconds=ep.duration_seconds,
                         original_language=feed.source_language,
                         transcript_source=(
-                            publisher.source_of(segments_path) if segments_path else "whisper"
+                            publisher.source_of(segments_path)
+                            if segments_path and segments_path.exists() else "whisper"
                         ),
+                        generated_by=summary_build,
                     ),
-                    attachments=attachments,
-                )
-            except MailProbablyDelivered as e:
-                # The message was fully transmitted; only the server's verdict
-                # never arrived. Sending isn't idempotent, so retrying would
-                # re-send the digest up to MAX_ATTEMPTS times — the duplicate
-                # storm this branch exists to prevent. Treat as delivered:
-                # advance + record, and say so loudly. Worst case (the server
-                # really did drop it) is one missing digest, visible here and
-                # recoverable; the alternative was N duplicates.
-                event(logger, logging.WARNING, "mail.probably_delivered",
-                      guid=ep.guid, title=ep.title, **err_fields(e))
-            now = datetime.now(UTC).isoformat(timespec="seconds")
-            db.set_status(
-                feed_url=ep.feed_url, guid=ep.guid,
-                status="emailed", emailed_at=now, terminal_reason="sent",
+                    attachments=tuple(attachments),
+                ),
+                show=feed.display_show,
             )
-            # Record in the shared delivery log so another instance won't
-            # re-send this episode. Best-effort: a failed append never fails the send.
-            emitted.record(
-                ep.feed_url,
-                ep.guid,
-                now,
-                feed.display_show,
-                ep.title,
-                fingerprint=content_fingerprint,
-            )
-            sent_now = True
-
-    # ---- 5. Cleanup audio (only after a real send; dry-run keeps audio so the
-    # next real tick doesn't have to re-download).
-    if sent_now and audio_path and audio_path.exists():
-        audio_cleanup(audio_path)
-        db.clear_audio_path(ep.feed_url, ep.guid)
+            if sent_now:
+                finalize_deliveries(db, emitted)
 
     return sent_now
+
+
+def finalize_deliveries(db: Database, emitted: EmittedLog) -> None:
+    """Retry accepted projections under the writer lock, even for removed feeds."""
+    for delivery in db.deliveries_pending_finalization():
+        try:
+            _finalize_delivery(delivery, db, emitted)
+        except Exception as exc:  # noqa: BLE001
+            event(logger, logging.WARNING, "delivery.finalization_pending",
+                  operation_id=delivery.operation_id, **err_fields(exc))
+
+
+def _finalize_delivery(delivery: DeliveryRow, db: Database, emitted: EmittedLog) -> None:
+    current = db.get_episode(delivery.feed_url, delivery.guid)
+    assert current is not None and current.emailed_at is not None
+    fingerprint = _load_or_create_content_fingerprint(
+        ep=current, transcript=None,
+        transcript_path=Path(current.transcript_path) if current.transcript_path else None,
+        db=db,
+    )
+    recorded = emitted.record(current.feed_url, current.guid, current.emailed_at,
+                              delivery.show, current.title, fingerprint=fingerprint)
+    if current.audio_path:
+        path = Path(current.audio_path)
+        audio_cleanup(path)
+        if path.exists():
+            return
+        db.clear_audio_path(current.feed_url, current.guid)
+    if recorded:
+        db.finalize_delivery(delivery.operation_id)
 
 
 def _load_or_create_content_fingerprint(
@@ -1175,7 +1254,7 @@ def _load_or_create_content_fingerprint(
     transcript: Transcript | None,
     transcript_path: Path | None,
     db: Database,
-) -> TranscriptFingerprint:
+) -> TranscriptFingerprint | None:
     if (
         ep.content_sha256 is not None
         and ep.content_minhash is not None
@@ -1194,6 +1273,14 @@ def _load_or_create_content_fingerprint(
                 ep.guid,
             )
 
+    if (
+        not stage_lt(ep.status, "summarized")
+        and transcript is None
+        and not (transcript_path and transcript_path.exists())
+    ):
+        # A persisted summary is sufficient to deliver. Missing artifacts must
+        # never move its stage backward or reset its failure budgets.
+        return None
     if transcript is not None:
         transcript_text = transcript.text
     elif transcript_path is not None:
@@ -1425,6 +1512,7 @@ def _build_subject(podcast: str, title: str, duration: int | None) -> str:
 # other code falls back to itself in the email note.
 _LANGUAGE_NAMES = {
     "zh": "Mandarin",
+    "yue": "Cantonese",
     "ja": "Japanese",
     "ko": "Korean",
     "de": "German",
@@ -1433,6 +1521,52 @@ _LANGUAGE_NAMES = {
     "it": "Italian",
     "pt": "Portuguese",
 }
+
+
+_YOUTUBE_TS_RE = re.compile(r"<strong>\[(\d{2}):(\d{2}):(\d{2})\]</strong>")
+
+_EMAIL_STYLE = (
+    "<style>"
+    ".pd-wrap{max-width:680px;margin:0 auto;font-family:-apple-system,BlinkMacSystemFont,"
+    "'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.6;color:#1f2937;}"
+    ".pd-body h2{font-size:16px;font-weight:700;margin:22px 0 8px 0;padding-bottom:4px;"
+    "border-bottom:1px solid #e5e7eb;}"
+    ".pd-body h3{font-size:14px;font-weight:600;margin:16px 0 6px 0;}"
+    ".pd-body ul,.pd-body ol{margin:8px 0 14px 0;padding-left:20px;}"
+    ".pd-body li{margin:0 0 6px 0;}"
+    ".pd-body p{margin:0 0 12px 0;}"
+    ".pd-body a{color:#4f46e5;text-decoration:none;}"
+    "@media (prefers-color-scheme:dark){"
+    ".pd-wrap{color:#e5e7eb;}"
+    ".pd-body h2{border-bottom-color:#374151;}"
+    ".pd-meta,.pd-foot{color:#9ca3af !important;}"
+    ".pd-eyebrow,.pd-body a,.pd-listen{color:#818cf8 !important;}"
+    ".pd-head,.pd-hr{border-color:#374151 !important;}"
+    "}"
+    "</style>"
+)
+
+
+def _link_youtube_timestamps(body_html: str, audio_url: str) -> str:
+    """Turn `[hh:mm:ss]` highlight markers into clickable YouTube deep links."""
+    if not youtube.is_youtube_url(audio_url):
+        return body_html
+    try:
+        video_id = youtube.extract_video_id(audio_url)
+    except youtube.FeedError:
+        return body_html
+    base = youtube.canonical_watch_url(video_id)
+
+    def _replace(match: re.Match[str]) -> str:
+        hh, mm, ss = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        total_seconds = hh * 3600 + mm * 60 + ss
+        href = f"{base}&t={total_seconds}s"
+        return (
+            f'<a href="{_escape(href)}" rel="noopener noreferrer">'
+            f"{match.group(0)}</a>"
+        )
+
+    return _YOUTUBE_TS_RE.sub(_replace, body_html)
 
 
 def _wrap_email(
@@ -1444,16 +1578,16 @@ def _wrap_email(
     duration_seconds: int | None = None,
     original_language: str | None = None,
     transcript_source: str = "whisper",
+    generated_by: BuildIdentity | None = None,
 ) -> str:
-    """Add a title + episode-metadata header and a footer around the model output.
+    """Wrap sanitized model HTML in a readable, dark-mode-safe digest layout.
 
-    The metadata line carries the podcast name, release date, and runtime so the
-    digest is useful on its own without opening the episode. The model summary is
-    sanitized at production and re-sanitized here (see sanitize.py) — the
-    email is the outward surface, so it never trusts storage, cheap as the
-    second pass is.
+    The header carries the podcast name, title, release date, runtime, and any
+    translation note. The model summary is sanitized at production and
+    re-sanitized here (see sanitize.py) before adding clickable YouTube
+    timestamps — the email is the outward surface, so it never trusts storage.
     """
-    meta_bits = [_escape(podcast)]
+    meta_bits: list[str] = []
     released = _fmt_release_date(published_at)
     if released:
         meta_bits.append(f"Released {released}")
@@ -1463,23 +1597,57 @@ def _wrap_email(
     if original_language:
         name = _LANGUAGE_NAMES.get(original_language, original_language)
         meta_bits.append(f"Translated from {_escape(name)}")
+    meta_line = (
+        f'<p class="pd-meta" style="color:#6b7280;font-size:13px;margin:0;">'
+        f"{' · '.join(meta_bits)}</p>"
+        if meta_bits else ""
+    )
+
     safe_url = safe_listen_url(audio_url)
-    footer_bits = []
+    footer_bits: list[str] = []
     if safe_url:
-        footer_bits.append(f'<a href="{_escape(safe_url)}">Listen to the episode</a>')
+        footer_bits.append(
+            f'<a class="pd-listen" href="{_escape(safe_url)}" '
+            f'style="color:#4f46e5;font-weight:600;text-decoration:none;">'
+            f"Listen to the episode</a>"
+        )
     if transcript_source == "publisher":
         footer_bits.append("Summarized from the publisher's transcript")
-    listen = (
-        f'<hr style="border:none;border-top:1px solid #ddd;margin:24px 0;">'
-        f'<p style="color:#666;font-size:12px;">{" · ".join(footer_bits)}</p>'
+    footer = (
+        f'<p class="pd-foot" style="color:#6b7280;font-size:13px;margin:0 0 8px 0;">'
+        f"{' · '.join(footer_bits)}</p>"
         if footer_bits else ""
     )
+    if generated_by is not None:
+        footer += (
+            f'<p class="pd-foot" style="color:#9ca3af;font-size:11px;margin:0;'
+            f'overflow-wrap:anywhere;">'
+            f"Generated by {_escape(generated_by.service)} {_escape(generated_by.version)}, "
+            f"source revision {_escape(generated_by.source_revision)}.</p>"
+        )
+    if footer:
+        footer = (
+            f'<hr class="pd-hr" style="border:none;border-top:1px solid #e5e7eb;'
+            f'margin:24px 0 16px 0;">{footer}'
+        )
+
+    clean_summary = _link_youtube_timestamps(sanitize_summary_html(summary_html), audio_url)
     return (
-        f'<p style="margin:0 0 4px 0;font-size:15px;"><strong>{_escape(title)}</strong></p>'
-        f'<p style="color:#666;font-size:12px;margin:0 0 16px 0;">'
-        f"{' · '.join(meta_bits)}</p>"
-        f"{sanitize_summary_html(summary_html)}"
-        f"{listen}"
+        f"{_EMAIL_STYLE}"
+        f'<div class="pd-wrap" style="max-width:680px;margin:0 auto;'
+        f"font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;"
+        f'font-size:15px;line-height:1.6;">'
+        f'<div class="pd-head" style="border-bottom:1px solid #e5e7eb;'
+        f'padding-bottom:14px;margin-bottom:20px;">'
+        f'<p class="pd-eyebrow" style="font-size:12px;font-weight:600;letter-spacing:0.04em;'
+        f'text-transform:uppercase;color:#4f46e5;margin:0 0 4px 0;">{_escape(podcast)}</p>'
+        f'<p style="margin:0 0 8px 0;font-size:20px;line-height:1.3;font-weight:700;">'
+        f"<strong>{_escape(title)}</strong></p>"
+        f"{meta_line}"
+        f"</div>"
+        f'<div class="pd-body">{clean_summary}</div>'
+        f"{footer}"
+        f"</div>"
     )
 
 

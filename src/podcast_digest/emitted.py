@@ -52,6 +52,7 @@ concatenates two instances' appends is always safe.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import unicodedata
 from datetime import UTC, datetime
@@ -286,17 +287,17 @@ class EmittedLog:
         show: str | None = None,
         title: str | None = None,
         fingerprint: TranscriptFingerprint | None = None,
-    ) -> None:
+    ) -> bool:
         """Append one emitted episode (both keys). No-op when disabled or dup.
 
         The append is a single ``write()`` of one newline-terminated line, which
         POSIX guarantees atomic for small writes — so a concurrent reader never
         sees a torn line and the file stays merge-safe. A write failure is logged
-        but never raised: the email already went out, and re-emailing on the next
-        run (the worst case of a lost record) beats failing a successful send.
+        but never raised. False leaves local accepted finalization pending;
+        the next tick retries publication without resending the email.
         """
         if self.path is None:
-            return
+            return True
         existing_content = self._content_by_episode.get((feed_url, guid))
         if (feed_url, guid) in self._guid_keys and (
             fingerprint is None
@@ -305,7 +306,7 @@ class EmittedLog:
                 and existing_content.fingerprint == fingerprint
             )
         ):
-            return
+            return self._sync()
         columns = [feed_url, guid, emitted_at, show or "", title or ""]
         if fingerprint is not None:
             columns.extend(
@@ -315,7 +316,7 @@ class EmittedLog:
                     str(fingerprint.token_count),
                 ]
             )
-        self._append(columns)
+        return self._append(columns)
 
     def content_candidates(self, since: datetime) -> list[ContentCandidate]:
         """Return delivered fingerprints at or after the UTC cutoff."""
@@ -349,13 +350,34 @@ class EmittedLog:
             return
         self._append(["", "", emitted_at, show, title])
 
-    def _append(self, cols: list[str]) -> None:
+    def _append(self, cols: list[str]) -> bool:
         line = "\t".join(c.replace("\t", " ").replace("\n", " ") for c in cols) + "\n"
         assert self.path is not None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as f:
                 f.write(line)
+            if not self._sync():
+                return False
             self._index(cols)
+            return True
         except OSError as e:
             logger.warning("emitted.append_failed path=%s err=%s", self.path, e)
+            return False
+
+    def _sync(self) -> bool:
+        # A prior append may have reached the page cache before fsync failed.
+        # Re-reading that row alone cannot finish durable local finalization.
+        assert self.path is not None
+        try:
+            with self.path.open("rb") as f:
+                os.fsync(f.fileno())
+            directory = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            return True
+        except OSError as e:
+            logger.warning("emitted.sync_failed path=%s err=%s", self.path, e)
+            return False
