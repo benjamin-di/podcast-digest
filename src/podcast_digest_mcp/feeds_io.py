@@ -14,10 +14,17 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
+import stat
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
 import tomlkit
+
+from podcast_digest.config import FeedsFile
+from podcast_digest.feeds import FeedError
+from podcast_digest.youtube import extract_video_id
 
 
 @dataclass(frozen=True)
@@ -28,7 +35,7 @@ class FeedEntry:
     youtube: str | None
     youtube_video: str | None
     audio_url: str | None
-    min_minutes: int
+    min_minutes: int | None
     # Non-English spoken language as a bare ISO-639-1 code (e.g. "zh"); None/"en"
     # keeps the English transcription path. Mirrors podcast_digest.config.Feed.
     language: str | None = None
@@ -45,6 +52,7 @@ class FeedsDoc:
     recipient: str
     poll_seconds: int
     feeds: list[FeedEntry]
+    min_minutes: int = 0
 
 
 # One lock per process — serialises concurrent ingest() writers.
@@ -62,7 +70,7 @@ def read(path: Path) -> FeedsDoc:
             youtube=_opt_str(f, "youtube"),
             youtube_video=_opt_str(f, "youtube_video"),
             audio_url=_opt_str(f, "audio_url"),
-            min_minutes=int(f.get("min_minutes", 0)),
+            min_minutes=_opt_int(f, "min_minutes"),
             language=_opt_str(f, "language"),
             published_at=_opt_str(f, "published_at"),
             duration_seconds=_opt_int(f, "duration_seconds"),
@@ -75,6 +83,7 @@ def read(path: Path) -> FeedsDoc:
         recipient=str(recipient),
         poll_seconds=int(raw.get("poll_seconds", 21600)),
         feeds=feeds,
+        min_minutes=int(raw.get("min_minutes", 0)),
     )
 
 
@@ -97,7 +106,7 @@ async def add_feed(
     youtube: str | None = None,
     youtube_video: str | None = None,
     audio_url: str | None = None,
-    min_minutes: int = 0,
+    min_minutes: int | None = None,
     language: str | None = None,
     published_at: str | None = None,
     duration_seconds: int | None = None,
@@ -125,6 +134,17 @@ async def add_feed(
         )
 
 
+def _same_youtube_video(a: str | None, b: str | None) -> bool:
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    try:
+        return extract_video_id(a) == extract_video_id(b)
+    except (ValueError, FeedError):
+        return False
+
+
 def _add_feed_blocking(
     path: Path,
     name: str,
@@ -133,7 +153,7 @@ def _add_feed_blocking(
     youtube: str | None,
     youtube_video: str | None,
     audio_url: str | None,
-    min_minutes: int,
+    min_minutes: int | None,
     language: str | None,
     published_at: str | None,
     duration_seconds: int | None,
@@ -155,7 +175,7 @@ def _add_feed_blocking(
             return ("already_subscribed", existing)
         if youtube and _opt_str(f, "youtube") == youtube:
             return ("already_subscribed", existing)
-        if youtube_video and _opt_str(f, "youtube_video") == youtube_video:
+        if youtube_video and _same_youtube_video(_opt_str(f, "youtube_video"), youtube_video):
             return ("already_subscribed", existing)
         if audio_url and _opt_str(f, "audio_url") == audio_url:
             return ("already_subscribed", existing)
@@ -175,19 +195,21 @@ def _add_feed_blocking(
     # Non-English feeds route to the multilingual whisper model (`-l <language>`).
     if language:
         entry["language"] = language
-    if min_minutes:
+    if min_minutes is not None:
         entry["min_minutes"] = min_minutes
     # Episode metadata for audio one-shots — write-once at ingest so the email
     # shows the real release date / runtime (Apple episode lookup).
     if published_at:
         entry["published_at"] = published_at
-    if duration_seconds:
+    if duration_seconds is not None and duration_seconds >= 0:
         entry["duration_seconds"] = duration_seconds
     if show:
         entry["show"] = show
     feeds.append(entry)
 
-    _atomic_write(path, tomlkit.dumps(doc))
+    rendered = tomlkit.dumps(doc)
+    FeedsFile.model_validate(tomllib.loads(rendered))
+    _atomic_write(path, rendered)
     return ("added", name)
 
 
@@ -212,21 +234,37 @@ def _remove_feed_blocking(path: Path, name: str) -> bool:
     if not removed:
         return False
     doc["feeds"] = new_feeds
-    _atomic_write(path, tomlkit.dumps(doc))
+    rendered = tomlkit.dumps(doc)
+    FeedsFile.model_validate(tomllib.loads(rendered))
+    _atomic_write(path, rendered)
     return True
 
 
 def _atomic_write(path: Path, content: str) -> None:
-    # tempfile in the SAME directory so os.replace is atomic across the rename
-    # (same filesystem). fsync the file, then rename, then fsync the dir.
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        f.write(content)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-    dir_fd = os.open(path.parent, os.O_RDONLY)
+    # Unique tempfile in the SAME directory so os.replace is atomic across the
+    # rename (same filesystem) and concurrent writers cannot collide. Preserve
+    # any existing file's permissions; for a new file the kernel applies umask.
+    existing_mode: int | None
     try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+        existing_mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        existing_mode = None
+    tmp = path.parent / f".{path.name}.{secrets.token_hex(8)}.tmp"
+    open_mode = existing_mode if existing_mode is not None else 0o666
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, open_mode)
+    try:
+        if existing_mode is not None:
+            os.fchmod(fd, existing_mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise

@@ -351,7 +351,10 @@ class EmittedLog:
         self._append(["", "", emitted_at, show, title])
 
     def _append(self, cols: list[str]) -> bool:
-        line = "\t".join(c.replace("\t", " ").replace("\n", " ") for c in cols) + "\n"
+        line = "\t".join(
+            re.sub(r"[\t\r\n\x0b\x0c\x1c-\x1e\x85\u2028\u2029]+", " ", c)
+            for c in cols
+        ) + "\n"
         assert self.path is not None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)

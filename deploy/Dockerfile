@@ -187,7 +187,7 @@ ENV WHISPER_MODEL_DIR=/data/models \
 # `pgrep -f` excludes its own PID by default; the literal command shows up
 # in /proc/<pid>/cmdline as space-joined argv, hence the regex.
 HEALTHCHECK --interval=5m --timeout=10s --start-period=10m --start-interval=2s --retries=3 \
-    CMD pgrep -f "podcast_digest.*serve|podcast-digest serve" >/dev/null || exit 1
+    CMD ["pgrep", "-f", "bin/podcast-digest serve|podcast_digest serve"]
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/podcast-entrypoint.sh"]
 CMD ["podcast-digest", "serve"]

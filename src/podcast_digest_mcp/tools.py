@@ -14,11 +14,13 @@ import asyncio
 import logging
 import re
 from pathlib import Path
+from typing import Annotated
 
 import httpx
 from fastmcp import FastMCP
+from pydantic import Field
 
-from podcast_digest.feeds import fetch_rss, parse_episodes
+from podcast_digest.feeds import FeedError, fetch_rss, parse_episodes
 from podcast_digest.net import validate_outbound_url_async
 from podcast_digest.wake import signal_wake
 from podcast_digest.youtube import (
@@ -47,259 +49,293 @@ def register(
 
     # -- ingest -----------------------------------------------------------
 
-    @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True})
+    @mcp.tool(
+        annotations={
+            "title": "Add podcast or episode",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": True,
+        }
+    )
     async def ingest(
-        url: str,
-        name: str | None = None,
-        min_minutes: int = 0,
-        language: str | None = None,
+        url: Annotated[
+            str,
+            Field(
+                description=(
+                    "URL to add: RSS feed, Apple Podcasts show or episode, YouTube channel or video, "
+                    "or direct audio file (.mp3/.m4a)."
+                )
+            ),
+        ],
+        name: Annotated[
+            str | None,
+            Field(description="Optional display name override; defaults to the resolved show, channel, or episode title."),
+        ] = None,
+        min_minutes: Annotated[
+            int | None,
+            Field(
+                ge=0,
+                description=(
+                    "Optional minimum episode duration in minutes "
+                    "(omit to inherit file default; 0 disables filtering)."
+                ),
+            ),
+        ] = None,
+        language: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional ISO-639-1 spoken language override (e.g. 'en', 'zh', 'ja'); "
+                    "omitted auto-detects from feed metadata and titles."
+                )
+            ),
+        ] = None,
     ) -> dict:
-        """Add a URL to feeds.toml.
+        """Subscribe to a podcast/YouTube channel or queue a one-shot episode/audio URL for digest delivery.
 
-        Smart routing:
-        * RSS feed URL → subscription, source = `rss_url`
-        * Apple Podcasts podcast page (`id<N>` without `?i=`) → resolved to
-          RSS via iTunes Lookup, source = `rss_url`
-        * YouTube channel URL (`/@handle`, `/channel/UC...`, `/c/...`,
-          `/user/...`) → subscription, source = `youtube`
-        * YouTube watch URL (`/watch?v=`, `/shorts/`, `youtu.be/...`) →
-          one-shot, source = `youtube_video` (processed exactly once)
-        * Direct audio URL (`.mp3`/`.m4a`, `audio/*`) → one-shot,
-          source = `audio_url`
-        * Apple Podcasts *episode* URL (`/id<N>?i=<trackId>`) → resolved to
-          its direct enclosure via iTunes Lookup → one-shot, source = `audio_url`
-
-        Language: leave `language` unset and the spoken language is auto-detected
-        (RSS `<language>`, else the script of the latest titles) — a non-English
-        feed transcribes with the multilingual model and still emails an English
-        summary. Pass an ISO-639-1 code (e.g. `"zh"`, `"ja"`) to force it, or
-        `"en"` to force the English path. `preview` reports what would be
-        detected, so call it first if unsure.
-
-        Idempotent: if an identical entry (same source value or same name)
-        already exists, returns `already_subscribed` instead of appending.
+        Classifies the URL automatically: RSS feeds, Apple Podcasts shows, and YouTube channels become
+        recurring subscriptions; individual YouTube videos, Apple Podcasts episodes, and direct audio links
+        are queued once. Non-English audio transcribes with the multilingual model and still delivers an
+        English summary. Idempotent: duplicate entries return `already_subscribed` without re-adding.
         """
+        if name is not None:
+            name = name.strip() or None
         try:
             c = await asyncio.to_thread(routing.classify, url, http=http_sync)
-        except ValueError as e:
-            return {"error": str(e)}
 
-        if c.kind == "rss":
-            title, declared, titles = await _rss_meta(c.canonical, http=http)
-            final_name = name or title or c.canonical
-            lang_code = lang.resolve_language(language, declared, [final_name, *titles])
-            return await _append(
-                feeds_path, kind="subscription",
-                name=final_name, rss_url=c.canonical, min_minutes=min_minutes,
-                language=lang_code,
-            )
+            if c.kind == "rss":
+                title, declared, titles = await _rss_meta(c.canonical, http=http)
+                final_name = name or title or c.canonical
+                lang_code = lang.resolve_language(language, declared, [final_name, *titles])
+                return await _append(
+                    feeds_path, kind="subscription",
+                    name=final_name, rss_url=c.canonical, min_minutes=min_minutes,
+                    language=lang_code,
+                )
 
-        if c.kind == "itunes_podcast":
-            p = await apple.lookup_podcast(c.canonical, http=http)
-            if error := await _publisher_url_error(p.rss_url):
-                return {"error": error}
-            _title, declared, titles = await _rss_meta(p.rss_url, http=http)
-            final_name = name or p.name
-            lang_code = lang.resolve_language(language, declared, [final_name, *titles])
-            return await _append(
-                feeds_path, kind="subscription",
-                name=final_name, rss_url=p.rss_url, min_minutes=min_minutes,
-                language=lang_code,
-            )
+            if c.kind == "itunes_podcast":
+                p = await apple.lookup_podcast(c.canonical, http=http)
+                if error := await _publisher_url_error(p.rss_url):
+                    return {"error": error}
+                _title, declared, titles = await _rss_meta(p.rss_url, http=http)
+                final_name = name or p.name
+                lang_code = lang.resolve_language(language, declared, [final_name, *titles])
+                return await _append(
+                    feeds_path, kind="subscription",
+                    name=final_name, rss_url=p.rss_url, min_minutes=min_minutes,
+                    language=lang_code,
+                )
 
-        if c.kind == "youtube_channel":
-            channel_feed = await resolve_channel_feed(c.canonical, client=http)
-            ch_name, titles = await _channel_meta(channel_feed)
-            channel_name = name or ch_name or c.canonical
-            lang_code = lang.resolve_language(language, None, [channel_name, *titles])
-            return await _append(
-                feeds_path, kind="subscription",
-                name=channel_name, youtube=c.canonical, min_minutes=min_minutes,
-                language=lang_code,
-            )
+            if c.kind == "youtube_channel":
+                channel_feed = await resolve_channel_feed(c.canonical, client=http)
+                ch_name, titles = await _channel_meta(channel_feed)
+                channel_name = name or ch_name or c.canonical
+                lang_code = lang.resolve_language(language, None, [channel_name, *titles])
+                return await _append(
+                    feeds_path, kind="subscription",
+                    name=channel_name, youtube=c.canonical, min_minutes=min_minutes,
+                    language=lang_code,
+                )
 
-        if c.kind == "youtube_video":
-            video_name = name or await _youtube_video_title(c.canonical) or c.canonical
-            lang_code = lang.resolve_language(language, None, [video_name])
-            return await _append(
-                feeds_path, kind="oneoff_youtube_video",
-                name=video_name, youtube_video=c.canonical, min_minutes=min_minutes,
-                language=lang_code,
-            )
+            if c.kind == "youtube_video":
+                video_name = name or await _youtube_video_title(c.canonical) or c.canonical
+                lang_code = lang.resolve_language(language, None, [video_name])
+                return await _append(
+                    feeds_path, kind="oneoff_youtube_video",
+                    name=video_name, youtube_video=c.canonical, min_minutes=min_minutes,
+                    language=lang_code,
+                )
 
-        if c.kind == "audio":
-            audio_name = name or await _audio_title(c.canonical, http=http) or c.canonical
-            lang_code = lang.resolve_language(language, None, [audio_name])
-            return await _append(
-                feeds_path, kind="oneoff_audio",
-                name=audio_name, audio_url=c.canonical, min_minutes=min_minutes,
-                language=lang_code,
-            )
+            if c.kind == "audio":
+                audio_name = name or await _audio_title(c.canonical, http=http) or c.canonical
+                lang_code = lang.resolve_language(language, None, [audio_name])
+                return await _append(
+                    feeds_path, kind="oneoff_audio",
+                    name=audio_name, audio_url=c.canonical, min_minutes=min_minutes,
+                    language=lang_code,
+                )
 
-        if c.kind == "itunes_episode":
-            try:
+            if c.kind == "itunes_episode":
                 ep = await apple.lookup_episode(
                     c.canonical, c.extra["episode_track_id"], http=http,
                 )
-            except ValueError as e:
-                return {"error": str(e)}
-            if error := await _publisher_url_error(ep.audio_url):
-                return {"error": error}
-            final_name = name or ep.title
-            lang_code = lang.resolve_language(
-                language, None, [final_name, ep.collection_name or ""],
-            )
-            return await _append(
-                feeds_path, kind="oneoff_audio",
-                name=final_name, audio_url=ep.audio_url, min_minutes=min_minutes,
-                language=lang_code,
-                # Persist the resolved metadata — a bare enclosure can't be
-                # re-resolved at processing time, so the pipeline would otherwise
-                # stamp the email with the processing date and no runtime. `show`
-                # is the podcast name (the one-shot's `name` is the episode title).
-                published_at=ep.published_at, duration_seconds=ep.duration_seconds,
-                show=ep.collection_name,
-            )
+                if error := await _publisher_url_error(ep.audio_url):
+                    return {"error": error}
+                final_name = name or ep.title
+                lang_code = lang.resolve_language(
+                    language, None, [final_name, ep.collection_name or ""],
+                )
+                return await _append(
+                    feeds_path, kind="oneoff_audio",
+                    name=final_name, audio_url=ep.audio_url, min_minutes=min_minutes,
+                    language=lang_code,
+                    # Persist the resolved metadata — a bare enclosure can't be
+                    # re-resolved at processing time, so the pipeline would otherwise
+                    # stamp the email with the processing date and no runtime. `show`
+                    # is the podcast name (the one-shot's `name` is the episode title).
+                    published_at=ep.published_at, duration_seconds=ep.duration_seconds,
+                    show=ep.collection_name,
+                )
 
-        return {"error": f"unhandled classification: {c.kind}"}
+            return {"error": f"unhandled classification: {c.kind}"}
+        except (ValueError, FeedError, httpx.HTTPError) as e:
+            return {"error": str(e)}
 
     # -- preview ----------------------------------------------------------
 
-    @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
-    async def preview(url: str) -> dict:
-        """Dry-run of `ingest`: resolve the URL and describe what would be added.
+    @mcp.tool(
+        annotations={
+            "title": "Preview podcast URL",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": True,
+        }
+    )
+    async def preview(
+        url: Annotated[
+            str,
+            Field(description="Podcast, RSS, Apple Podcasts, YouTube, or direct audio URL to classify without saving."),
+        ],
+    ) -> dict:
+        """Dry-run of ingest: resolve a URL and report its classification, detected language, and recent titles.
 
-        No file writes. For an RSS feed or Apple Podcasts podcast page, returns
-        the feed title + the last 3 episode titles, and whether those episodes
-        link a publisher transcript (used instead of local transcription). For a YouTube channel, the
-        channel name + last 3 video titles. For a YouTube video, title +
-        duration via yt-dlp. For a direct audio URL, the derived name +
-        content-type + size. For an Apple Podcasts episode, the resolved title,
-        duration, and enclosure URL.
+        Makes no writes. Returns feed/channel metadata and latest 3 titles (plus publisher transcript detection
+        for RSS/Apple Podcasts), or episode title, duration, and enclosure/media metadata for one-shot URLs.
         """
         try:
             c = await asyncio.to_thread(routing.classify, url, http=http_sync)
-        except ValueError as e:
-            return {"error": str(e)}
 
-        if c.kind == "rss":
-            body = await fetch_rss(c.canonical, client=http)
-            episodes = parse_episodes(body)
-            name = _rss_title_from_body(body) or "(unknown)"
-            titles = [e.title for e in episodes[:3]]
-            return {
-                "kind": "subscription",
-                "source": "rss_url",
-                "name": name,
-                "rss_url": c.canonical,
-                "latest_episodes": titles,
-                # Whether recent episodes link a publisher transcript, which the
-                # digest then uses instead of transcribing the audio.
-                "publisher_transcripts": any(e.transcripts for e in episodes[:3]),
-                "language": lang.resolve_language(
-                    None, _rss_language_from_body(body), [name, *titles],
-                ),
-            }
+            if c.kind == "rss":
+                body = await fetch_rss(c.canonical, client=http)
+                rss_title, declared_lang, episodes = await asyncio.to_thread(
+                    _parse_rss_once, body,
+                )
+                name = rss_title or "(unknown)"
+                titles = [e.title for e in episodes[:3]]
+                return {
+                    "kind": "subscription",
+                    "source": "rss_url",
+                    "name": name,
+                    "rss_url": c.canonical,
+                    "latest_episodes": titles,
+                    # Whether recent episodes link a publisher transcript, which the
+                    # digest then uses instead of transcribing the audio.
+                    "publisher_transcripts": any(e.transcripts for e in episodes[:3]),
+                    "language": lang.resolve_language(
+                        None, declared_lang, [name, *titles],
+                    ),
+                }
 
-        if c.kind == "itunes_podcast":
-            p = await apple.lookup_podcast(c.canonical, http=http)
-            if error := await _publisher_url_error(p.rss_url):
-                return {"error": error}
-            body = await fetch_rss(p.rss_url, client=http)
-            episodes = parse_episodes(body)
-            titles = [e.title for e in episodes[:3]]
-            return {
-                "kind": "subscription",
-                "source": "rss_url",
-                "name": p.name,
-                "rss_url": p.rss_url,
-                "latest_episodes": titles,
-                # Whether recent episodes link a publisher transcript, which the
-                # digest then uses instead of transcribing the audio.
-                "publisher_transcripts": any(e.transcripts for e in episodes[:3]),
-                "language": lang.resolve_language(
-                    None, _rss_language_from_body(body), [p.name, *titles],
-                ),
-            }
+            if c.kind == "itunes_podcast":
+                p = await apple.lookup_podcast(c.canonical, http=http)
+                if error := await _publisher_url_error(p.rss_url):
+                    return {"error": error}
+                body = await fetch_rss(p.rss_url, client=http)
+                _rss_title, declared_lang, episodes = await asyncio.to_thread(
+                    _parse_rss_once, body,
+                )
+                titles = [e.title for e in episodes[:3]]
+                return {
+                    "kind": "subscription",
+                    "source": "rss_url",
+                    "name": p.name,
+                    "rss_url": p.rss_url,
+                    "latest_episodes": titles,
+                    # Whether recent episodes link a publisher transcript, which the
+                    # digest then uses instead of transcribing the audio.
+                    "publisher_transcripts": any(e.transcripts for e in episodes[:3]),
+                    "language": lang.resolve_language(
+                        None, declared_lang, [p.name, *titles],
+                    ),
+                }
 
-        if c.kind == "youtube_channel":
-            channel_feed = await resolve_channel_feed(c.canonical, client=http)
-            channel_name, episodes = await list_channel_uploads(channel_feed, limit=5)
-            titles = [e.title for e in episodes]
-            return {
-                "kind": "subscription",
-                "source": "youtube",
-                "name": channel_name or c.canonical,
-                "youtube": c.canonical,
-                "latest_episodes": titles[:3],
-                "language": lang.resolve_language(None, None, [channel_name or "", *titles]),
-            }
+            if c.kind == "youtube_channel":
+                channel_feed = await resolve_channel_feed(c.canonical, client=http)
+                channel_name, episodes = await list_channel_uploads(channel_feed, limit=5)
+                titles = [e.title for e in episodes]
+                return {
+                    "kind": "subscription",
+                    "source": "youtube",
+                    "name": channel_name or c.canonical,
+                    "youtube": c.canonical,
+                    "latest_episodes": titles[:3],
+                    "language": lang.resolve_language(None, None, [channel_name or "", *titles]),
+                }
 
-        if c.kind == "youtube_video":
-            video_ep = await single_video_episode(c.canonical)
-            return {
-                "kind": "oneoff_youtube_video",
-                "source": "youtube_video",
-                "name": video_ep.title,
-                "youtube_video": c.canonical,
-                "duration_seconds": video_ep.duration_seconds,
-                "language": lang.resolve_language(None, None, [video_ep.title]),
-            }
+            if c.kind == "youtube_video":
+                video_ep = await single_video_episode(c.canonical)
+                return {
+                    "kind": "oneoff_youtube_video",
+                    "source": "youtube_video",
+                    "name": video_ep.title,
+                    "youtube_video": c.canonical,
+                    "duration_seconds": video_ep.duration_seconds,
+                    "language": lang.resolve_language(None, None, [video_ep.title]),
+                }
 
-        if c.kind == "audio":
-            head = await _audio_head(c.canonical, http=http)
-            audio_name = _audio_name(c.canonical, head) or c.canonical
-            return {
-                "kind": "oneoff_audio",
-                "source": "audio_url",
-                "name": audio_name,
-                "audio_url": c.canonical,
-                "content_type": head.get("content_type") or c.extra.get("content_type"),
-                "size_bytes": head.get("size_bytes"),
-                "language": lang.resolve_language(None, None, [audio_name]),
-            }
+            if c.kind == "audio":
+                head = await _audio_head(c.canonical, http=http)
+                audio_name = _audio_name(c.canonical, head) or c.canonical
+                return {
+                    "kind": "oneoff_audio",
+                    "source": "audio_url",
+                    "name": audio_name,
+                    "audio_url": c.canonical,
+                    "content_type": head.get("content_type") or c.extra.get("content_type"),
+                    "size_bytes": head.get("size_bytes"),
+                    "language": lang.resolve_language(None, None, [audio_name]),
+                }
 
-        if c.kind == "itunes_episode":
-            try:
+            if c.kind == "itunes_episode":
                 apple_ep = await apple.lookup_episode(
                     c.canonical, c.extra["episode_track_id"], http=http,
                 )
-            except ValueError as e:
-                return {"error": str(e)}
-            if error := await _publisher_url_error(apple_ep.audio_url):
-                return {"error": error}
-            return {
-                "kind": "oneoff_audio",
-                "source": "audio_url",
-                "name": apple_ep.title,
-                "collection": apple_ep.collection_name,
-                "audio_url": apple_ep.audio_url,
-                "duration_seconds": apple_ep.duration_seconds,
-                "published_at": apple_ep.published_at,
-                "language": lang.resolve_language(
-                    None, None, [apple_ep.title, apple_ep.collection_name or ""],
-                ),
-            }
+                if error := await _publisher_url_error(apple_ep.audio_url):
+                    return {"error": error}
+                return {
+                    "kind": "oneoff_audio",
+                    "source": "audio_url",
+                    "name": apple_ep.title,
+                    "collection": apple_ep.collection_name,
+                    "audio_url": apple_ep.audio_url,
+                    "duration_seconds": apple_ep.duration_seconds,
+                    "published_at": apple_ep.published_at,
+                    "language": lang.resolve_language(
+                        None, None, [apple_ep.title, apple_ep.collection_name or ""],
+                    ),
+                }
 
-        return {"error": f"unhandled classification: {c.kind}"}
+            return {"error": f"unhandled classification: {c.kind}"}
+        except (ValueError, FeedError, httpx.HTTPError) as e:
+            return {"error": str(e)}
 
     # -- subscription_list ------------------------------------------------
 
-    @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
-    async def subscription_list(include_completed_oneoffs: bool = False) -> dict:
-        """Read feeds.toml and return entries with their source kind and type.
+    @mcp.tool(
+        annotations={
+            "title": "List podcast subscriptions",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        }
+    )
+    async def subscription_list(
+        include_completed_oneoffs: Annotated[
+            bool,
+            Field(description="Include one-shot episodes that have already been processed (hidden by default)."),
+        ] = False,
+    ) -> dict:
+        """List configured recurring subscriptions and queued one-shot episodes with their source kind and settings.
 
-        feeds.toml holds two kinds of entry, distinguished by `type`:
-        * `subscription` — recurring (`rss_url` / `search` / `youtube`); the
-          newest episode is picked up every poll tick, indefinitely.
-        * `oneoff` — a single episode (`youtube_video` / `audio_url`); processed
-          exactly once, then deduped. Completed one-offs are hidden by default
-          when state.db is available; pass `include_completed_oneoffs=True` to
-          include them.
+        Completed one-shot episodes are omitted by default; pass include_completed_oneoffs=true to include them.
         """
         doc = await asyncio.to_thread(feeds_io.read, feeds_path)
+        has_oneoffs = any(_feed_type(_source_of(f)) == "oneoff" for f in doc.feeds)
         completed = (
-            set() if include_completed_oneoffs
+            set() if (include_completed_oneoffs or not has_oneoffs)
             else await asyncio.to_thread(archive.completed_oneoff_keys, data_dir)
         )
         items = []
@@ -320,7 +356,7 @@ def register(
                 "type": feed_type,
                 "source": source,
                 "value": value,
-                "min_minutes": f.min_minutes,
+                "min_minutes": f.min_minutes if f.min_minutes is not None else doc.min_minutes,
                 "language": f.language,
             })
         counts = {
@@ -332,30 +368,47 @@ def register(
         return {
             "recipient": doc.recipient,
             "poll_seconds": doc.poll_seconds,
+            "min_minutes": doc.min_minutes,
             "counts": counts,
             "feeds": items,
         }
 
     # -- digest_status ----------------------------------------------------
 
-    @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
-    async def digest_status(limit: int = 10) -> dict:
-        """Return read-only digest status: stage counts, recent deliveries,
-        in-progress episodes, held unknown deliveries, and feed errors."""
+    @mcp.tool(
+        annotations={
+            "title": "Digest pipeline status",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        }
+    )
+    async def digest_status(
+        limit: Annotated[int, Field(ge=1, le=100, description="Maximum recent deliveries and errors to return.")] = 10,
+    ) -> dict:
+        """Read digest pipeline status: stage counts, recent deliveries, in-progress episodes, held deliveries, and feed errors."""
         return await asyncio.to_thread(archive.digest_status, data_dir, limit=limit)
 
     # -- search_transcripts -----------------------------------------------
 
-    @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
+    @mcp.tool(
+        annotations={
+            "title": "Search podcast transcripts",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        }
+    )
     async def search_transcripts(
-        query: str,
-        feed: str | None = None,
-        limit: int = 10,
+        query: Annotated[str, Field(description="Keyword or phrase query over saved podcast summaries and transcripts.")],
+        feed: Annotated[str | None, Field(description="Optional feed or show name filter.")] = None,
+        limit: Annotated[int, Field(ge=1, le=50, description="Maximum matching episodes to return.")] = 10,
     ) -> dict:
         """Search saved podcast summaries and transcripts by keyword(s).
 
-        Returns matching episodes ranked by relevance with context snippets and
-        GUIDs that can be passed to `get_episode`.
+        Returns matching episodes ranked by relevance with context snippets and GUIDs for get_episode.
         """
         return await asyncio.to_thread(
             archive.search_transcripts, data_dir, query=query, feed=feed, limit=limit,
@@ -363,21 +416,31 @@ def register(
 
     # -- get_episode ------------------------------------------------------
 
-    @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
+    @mcp.tool(
+        annotations={
+            "title": "Get podcast episode",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        }
+    )
     async def get_episode(
-        query_or_guid: str,
-        include_transcript: bool = True,
-        max_chars: int = 40_000,
-        offset: int = 0,
+        query_or_guid: Annotated[str, Field(description="Episode GUID from search_transcripts or a title search string.")],
+        feed: Annotated[str | None, Field(description="Optional feed URL or show name to disambiguate colliding GUIDs.")] = None,
+        include_transcript: Annotated[bool, Field(description="Include the saved transcript text alongside the summary.")] = True,
+        max_chars: Annotated[int, Field(ge=1000, le=200_000, description="Maximum transcript characters returned in this slice.")] = 40_000,
+        offset: Annotated[int, Field(ge=0, description="Character offset for paginating long transcripts.")] = 0,
     ) -> dict:
-        """Read one episode's metadata, summary, and saved transcript (cleaned
-        Markdown preferred, raw text fallback). Use `offset` and `max_chars` to
-        paginate long transcripts.
+        """Read one episode's metadata, summary, and saved transcript (cleaned Markdown preferred, raw text fallback).
+
+        Use offset and max_chars to paginate long transcripts.
         """
         return await asyncio.to_thread(
             archive.get_episode,
             data_dir,
             query_or_guid=query_or_guid,
+            feed=feed,
             include_transcript=include_transcript,
             max_chars=max_chars,
             offset=offset,
@@ -385,25 +448,37 @@ def register(
 
     # -- subscription_remove ---------------------------------------------
 
-    @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False})
-    async def subscription_remove(name: str) -> dict:
-        """Remove every feeds.toml entry whose `name` matches exactly."""
+    @mcp.tool(
+        annotations={
+            "title": "Remove podcast subscription",
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        }
+    )
+    async def subscription_remove(
+        name: Annotated[str, Field(description="Exact subscription or one-shot entry name from subscription_list.")],
+    ) -> dict:
+        """Remove every configured subscription or one-shot entry whose name matches exactly."""
         removed = await feeds_io.remove_feed(feeds_path, name=name)
         return {"removed": removed, "name": name}
 
     # -- process_now ------------------------------------------------------
 
-    @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True})
+    @mcp.tool(
+        annotations={
+            "title": "Trigger digest processing",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": True,
+        }
+    )
     async def process_now() -> dict:
-        """Trigger the digest to run a processing tick now, instead of waiting
-        for the next scheduled poll.
+        """Signal the digest pipeline to run a processing tick immediately instead of waiting for the next poll.
 
-        `ingest` already does this automatically after adding a feed/episode;
-        use this to force a run manually (e.g. after editing feeds.toml directly,
-        or to retry a feed that failed). The digest picks up the signal within a
-        few seconds and downloads/transcribes/summarizes/emails any pending
-        episodes. Safe to call repeatedly: ticks are single-flight (a run already
-        in progress is never duplicated) and a no-op when nothing is pending.
+        Safe to call repeatedly: ticks are single-flight and a no-op when no episodes are pending.
         """
         return {"triggered": _signal_processing(feeds_path)}
 
@@ -431,7 +506,7 @@ async def _append(
     youtube: str | None = None,
     youtube_video: str | None = None,
     audio_url: str | None = None,
-    min_minutes: int = 0,
+    min_minutes: int | None = None,
     language: str | None = None,
     published_at: str | None = None,
     duration_seconds: int | None = None,
@@ -548,17 +623,15 @@ async def _audio_title(url: str, *, http: httpx.AsyncClient) -> str | None:
     return _audio_name(url, await _audio_head(url, http=http))
 
 
-def _rss_title_from_body(body: bytes) -> str | None:
+def _parse_rss_once(body: bytes) -> tuple[str | None, str | None, list]:
+    """Parse an RSS/Atom body once and return (feed_title, declared_language, episodes)."""
     import feedparser
     parsed = feedparser.parse(body)
-    return (parsed.feed.get("title") if hasattr(parsed, "feed") else None) or None
-
-
-def _rss_language_from_body(body: bytes) -> str | None:
-    """The channel-level `<language>` declared by an RSS/Atom feed, if any."""
-    import feedparser
-    parsed = feedparser.parse(body)
-    return (parsed.feed.get("language") if hasattr(parsed, "feed") else None) or None
+    feed_obj = parsed.feed if hasattr(parsed, "feed") else {}
+    title = feed_obj.get("title") or None
+    declared = feed_obj.get("language") or None
+    episodes = parse_episodes(body)
+    return title, declared, episodes
 
 
 async def _rss_meta(
@@ -569,8 +642,8 @@ async def _rss_meta(
     off the URL alone."""
     try:
         body = await fetch_rss(rss_url, client=http)
-        titles = [e.title for e in parse_episodes(body)[:5]]
-        return _rss_title_from_body(body), _rss_language_from_body(body), titles
+        title, declared, episodes = await asyncio.to_thread(_parse_rss_once, body)
+        return title, declared, [e.title for e in episodes[:5]]
     except Exception:
         return None, None, []
 

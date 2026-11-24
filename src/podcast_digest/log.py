@@ -467,13 +467,15 @@ def configure(level: str | None = None, *, mcp: bool = False) -> None:
     level = (level or os.environ.get("LOG_LEVEL", "INFO")).upper()
     root = logging.getLogger()
     if not root.handlers:
+        # Validate and apply level before attaching the handler so an invalid
+        # LOG_LEVEL fails cleanly without leaving a half-configured handler.
+        root.setLevel(level)
         h = logging.StreamHandler(sys.stderr)
         if not mcp and sys.stderr.isatty():
             h.setFormatter(_KVFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
         else:
             h.setFormatter(_JsonFormatter("logger" if mcp else "name"))
         root.addHandler(h)
-        root.setLevel(level)
     if not mcp:
         for name in ("httpx", "httpcore", "anthropic._base_client"):
             noisy = logging.getLogger(name)

@@ -384,9 +384,11 @@ def test_actual_mcp_initialize_acceptance_rejects_framework_version(monkeypatch)
 
 def test_publishers_pass_product_versions_to_each_build_and_smoke():
     import yaml
+    checked_workflows = 0
     for path in [ROOT / ".github/workflows/release.yml", ROOT / "publish/overlay/.github/workflows/release.yml"]:
-        if not path.exists():  # The private overlay is excluded from the public export.
+        if not path.exists():  # Private repo keeps only the public overlay; public export has .github/workflows.
             continue
+        checked_workflows += 1
         workflow = yaml.safe_load(path.read_text())
         steps = workflow["jobs"]["build-and-push"]["steps"]
         builds = [step["with"] for step in steps if step.get("uses", "").startswith("docker/build-push-action")]
@@ -405,6 +407,18 @@ def test_publishers_pass_product_versions_to_each_build_and_smoke():
         smokes = [step["run"] for step in steps if "scripts/smoke-image.sh" in step.get("run", "")]
         assert len(smokes) == 3
         assert all('"${{ steps.source.outputs.transcriber_version }}"' in command for command in smokes)
+    assert checked_workflows >= 1
+
+    native_release = ROOT / ".github/jenkins/ci-release.sh"
+    if native_release.exists():
+        script = native_release.read_text(encoding="utf-8")
+        assert script.count("--provenance=mode=max") == 3
+        assert script.count('--attest "type=sbom,generator=$gen"') == 3
+        assert '--build-arg "VERSION=$transcriber_version"' in script
+        assert '--build-arg "TRANSCRIBER_IMAGE=$transcriber_repo@$t_digest"' in script
+        assert '--build-arg "TRANSCRIBER_VERSION=$transcriber_version"' in script
+        for variant in ("transcriber", "podcast", "mcp"):
+            assert f'bash scripts/smoke-image.sh {variant} "$image" "$FLEET_SHA" "$version" "$transcriber_version"' in script
 
 
 def test_rich_sdk_sink_keeps_stream_threshold_and_filters(clean_logging):

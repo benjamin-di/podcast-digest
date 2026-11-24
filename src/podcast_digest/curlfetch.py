@@ -56,6 +56,7 @@ async def fetch_to_file(
     max_time: str,
     timeout: float,
     label: str,
+    max_bytes: int | None = None,
 ) -> str:
     """GET ``url`` into ``dest``, following redirects one validated hop at a
     time. Returns the final (post-redirect) URL whose body is in ``dest``.
@@ -69,17 +70,24 @@ async def fetch_to_file(
     hop_url = url
     for _ in range(MAX_HOPS):
         target = await resolve_outbound_url_async(hop_url)
+        cmd = [
+            "curl", "-fsS", "--max-time", max_time, "-A", user_agent,
+            *_curl_resolve_args(target),
+        ]
+        if max_bytes is not None:
+            cmd += ["--max-filesize", str(max_bytes)]
+        cmd += ["-o", str(dest), "-w", "%{http_code}\t%{redirect_url}", "--", hop_url]
         rc, out, err = await run_capture(
-            ["curl", "-fsS", "--max-time", max_time, "-A", user_agent,
-             *_curl_resolve_args(target),
-             "-o", str(dest), "-w", "%{http_code}\t%{redirect_url}",
-             "--", hop_url],
-            timeout=timeout, label=label,
+            cmd, timeout=timeout, label=label,
         )
         if rc != 0:
             raise CurlFetchError(
                 f"{label} failed (rc={rc}) for {hop_url}: "
                 f"{err.decode(errors='replace')[:200]}"
+            )
+        if max_bytes is not None and dest.exists() and dest.stat().st_size > max_bytes:
+            raise CurlFetchError(
+                f"{label}: response exceeded {max_bytes} byte limit for {hop_url}"
             )
         status_s, _, redirect_url = (
             out.decode(errors="replace").strip().partition("\t")

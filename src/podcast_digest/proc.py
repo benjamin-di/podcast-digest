@@ -31,10 +31,10 @@ class SubprocessTimeout(RuntimeError):
     """A wrapped subprocess exceeded its timeout and was killed."""
 
 
-def _kill_group(proc: asyncio.subprocess.Process) -> None:
+def _kill_group(proc: asyncio.subprocess.Process, *, force_group: bool = False) -> None:
     """SIGKILL the child's whole process group (started with its own session,
     so pid == pgid). Best-effort: the group may already be gone."""
-    if proc.returncode is not None:
+    if not force_group and proc.returncode is not None:
         return
     try:
         os.killpg(proc.pid, signal.SIGKILL)
@@ -42,8 +42,9 @@ def _kill_group(proc: asyncio.subprocess.Process) -> None:
         pass
     except PermissionError:
         # Group owned elsewhere (rare) — fall back to a single-process kill.
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
 
 
 async def run_capture(
@@ -66,24 +67,26 @@ async def run_capture(
         env=env,
         start_new_session=True,
     )
+    completed = False
     try:
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=timeout
         )
+        completed = True
     except TimeoutError:
         logger.warning("proc.timeout label=%s timeout_s=%s cmd=%s",
                        label, timeout, cmd[0])
         raise SubprocessTimeout(f"{label} timed out after {timeout}s") from None
     finally:
         # Whatever the exit path — timeout, cancellation, or any other exception
-        # out of communicate() — never leave the child running/un-reaped (the
-        # whole reason this helper exists). On the success path returncode is
-        # already set, so this is a no-op. Swallow only Exception during the reap
-        # (a CancelledError must still propagate).
-        if proc.returncode is None:
-            _kill_group(proc)
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(proc.wait(), timeout=10)
+        # out of communicate() — never leave the child or its descendants
+        # running/un-reaped (even if the leader exited while a descendant still
+        # held a pipe open). On the success path completed is True.
+        if not completed:
+            _kill_group(proc, force_group=True)
+            if proc.returncode is None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(proc.wait(), timeout=10)
     # communicate() returned without raising, so the child has exited and
     # returncode is set (every exception path re-raises past the finally).
     assert proc.returncode is not None

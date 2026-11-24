@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS episodes (
     failed_at TEXT,
     emailed_at TEXT,
     wiki_pushed_at TEXT,
+    search_indexed_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (feed_url, guid)
@@ -173,6 +174,16 @@ CREATE INDEX IF NOT EXISTS idx_episodes_status
     ON episodes(status);
 CREATE INDEX IF NOT EXISTS idx_episodes_published
     ON episodes(feed_url, published_at DESC);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS episode_search USING fts5(
+    feed_url UNINDEXED,
+    guid UNINDEXED,
+    show,
+    title,
+    summary,
+    transcript,
+    tokenize='unicode61'
+);
 """
 
 
@@ -368,6 +379,21 @@ class Database:
             )
         if "summary_build" not in have:
             self._conn.execute("ALTER TABLE episodes ADD COLUMN summary_build TEXT")
+        if "search_indexed_at" not in have:
+            self._conn.execute("ALTER TABLE episodes ADD COLUMN search_indexed_at TEXT")
+            # Mark rows already in episode_search in one FTS scan rather than a
+            # correlated scan per episode.
+            indexed_keys = self._conn.execute(
+                "SELECT DISTINCT feed_url, guid FROM episode_search"
+            ).fetchall()
+            if indexed_keys:
+                now = _now()
+                with self.tx():
+                    self._conn.executemany(
+                        "UPDATE episodes SET search_indexed_at = ? "
+                        "WHERE feed_url = ? AND guid = ?",
+                        [(now, r["feed_url"], r["guid"]) for r in indexed_keys],
+                    )
         self._prune_finalized_delivery_attachments()
 
     def _prune_finalized_delivery_attachments(self) -> None:
@@ -569,8 +595,15 @@ class Database:
                 SET audio_url=?, duration_seconds=COALESCE(?, duration_seconds),
                     updated_at=?
                 WHERE feed_url=? AND guid=?
+                  AND (
+                      audio_url != ?
+                      OR (? IS NOT NULL AND (duration_seconds IS NULL OR duration_seconds != ?))
+                  )
                 """,
-                (audio_url, duration_seconds, _now(), feed_url, guid),
+                (
+                    audio_url, duration_seconds, _now(), feed_url, guid,
+                    audio_url, duration_seconds, duration_seconds,
+                ),
             )
             return False
         candidates = self._conn.execute(
@@ -588,15 +621,21 @@ class Database:
         if len(matches) != 1:
             return False
         old_guid = matches[0]["guid"]
-        cur = self._conn.execute(
-            """
-            UPDATE episodes
-            SET guid=?, audio_url=?, duration_seconds=COALESCE(?, duration_seconds),
-                updated_at=?
-            WHERE feed_url=? AND guid=?
-            """,
-            (guid, audio_url, duration_seconds, _now(), feed_url, old_guid),
-        )
+        with self.tx():
+            cur = self._conn.execute(
+                """
+                UPDATE episodes
+                SET guid=?, audio_url=?, duration_seconds=COALESCE(?, duration_seconds),
+                    updated_at=?
+                WHERE feed_url=? AND guid=?
+                """,
+                (guid, audio_url, duration_seconds, _now(), feed_url, old_guid),
+            )
+            if cur.rowcount == 1:
+                self._conn.execute(
+                    "UPDATE episode_search SET guid=? WHERE feed_url=? AND guid=?",
+                    (guid, feed_url, old_guid),
+                )
         return cur.rowcount == 1
 
     def set_status(
@@ -1022,6 +1061,54 @@ class Database:
             active.append(min(throttled, key=lambda r: r.summarize_attempts))
         return active
 
+    # ---- full-text search index (FTS5) ---------------------------------
+
+    def upsert_search_index(
+        self,
+        *,
+        feed_url: str,
+        guid: str,
+        show: str,
+        title: str,
+        summary_text: str,
+        transcript_text: str,
+    ) -> None:
+        """Insert or replace one episode's FTS5 document."""
+        def _write() -> None:
+            self._conn.execute(
+                "DELETE FROM episode_search WHERE feed_url=? AND guid=?",
+                (feed_url, guid),
+            )
+            self._conn.execute(
+                "INSERT INTO episode_search (feed_url, guid, show, title, summary, transcript) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (feed_url, guid, show, title, summary_text, transcript_text),
+            )
+            self._conn.execute(
+                "UPDATE episodes SET search_indexed_at=? WHERE feed_url=? AND guid=?",
+                (_now(), feed_url, guid),
+            )
+
+        if self._conn.in_transaction:
+            _write()
+        else:
+            with self.tx():
+                _write()
+
+    def unindexed_searchable_episodes(self) -> list[tuple[EpisodeRow, str]]:
+        """Episodes with a summary or transcript not yet present in episode_search."""
+        rows = self._conn.execute(
+            """
+            SELECT e.*, COALESCE(f.name, e.feed_url) AS show_name
+            FROM episodes e
+            LEFT JOIN feeds f ON f.url = e.feed_url
+            WHERE (e.summary_html IS NOT NULL OR e.transcript_path IS NOT NULL)
+              AND e.search_indexed_at IS NULL
+            ORDER BY COALESCE(e.emailed_at, e.published_at, e.updated_at) DESC
+            """
+        ).fetchall()
+        return [(EpisodeRow.from_row(r), str(r["show_name"])) for r in rows]
+
     def rekey_feed(self, old_url: str, new_url: str) -> int:
         """Migrate a feed's identity from one URL PK to another, atomically.
 
@@ -1034,9 +1121,19 @@ class Database:
         episode state machine.
 
         Guid collisions (an episode already tracked under the new URL) keep the
-        new row and drop the old one. Returns the number of episodes migrated.
+        new row and drop the old one (rolling back via FK constraint if any
+        retained delivery record references the colliding old episode). Returns
+        the number of episodes migrated.
         """
         with self.tx():
+            # Remove colliding FTS5 entries for old_url before migrating so
+            # episode_search never retains duplicate rows after a collision.
+            self._conn.execute(
+                "DELETE FROM episode_search WHERE feed_url=? AND guid IN ("
+                "  SELECT guid FROM episodes WHERE feed_url=?"
+                ")",
+                (old_url, new_url),
+            )
             cur = self._conn.execute(
                 "UPDATE OR IGNORE episodes SET feed_url=?, updated_at=? "
                 "WHERE feed_url=?",
@@ -1057,6 +1154,10 @@ class Database:
                 "UPDATE OR IGNORE feeds SET url=? WHERE url=?", (new_url, old_url)
             )
             self._conn.execute("DELETE FROM feeds WHERE url=?", (old_url,))
+            self._conn.execute(
+                "UPDATE episode_search SET feed_url=? WHERE feed_url=?",
+                (new_url, old_url),
+            )
         return migrated
 
 

@@ -26,6 +26,13 @@ from .identity import BUILD
 
 logger = logging.getLogger(__name__)
 
+INSTRUCTIONS = (
+    "Manage podcast and video digest subscriptions and search saved summaries/transcripts. "
+    "Use preview to inspect how a URL will be classified and its detected language before calling ingest. "
+    "ingest saves a subscription or one-shot episode and wakes the background digest pipeline asynchronously; "
+    "digest_status shows pipeline progress and recent deliveries."
+)
+
 
 
 
@@ -53,6 +60,7 @@ def build_app():
     mcp = FastMCP(
         "podcast-digest",
         version=BUILD.version,  # serverInfo: this package's version, not FastMCP's
+        instructions=INSTRUCTIONS,
         # Header bearer only: tokens in URLs end up in access logs.
         auth=StaticTokenVerifier(tokens={token: {"client_id": "bearer", "scopes": []}}),
         # Unexpected exceptions reach clients as a generic error, not their

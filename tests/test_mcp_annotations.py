@@ -24,5 +24,13 @@ def test_tool_annotations(monkeypatch, tmp_path):
         "get_episode",
     }
     assert all(t.annotations is not None for t in tools.values())
+    assert all(t.annotations.title for t in tools.values())
+    assert all(t.annotations.destructive_hint is False for name, t in tools.items() if name != "subscription_remove")
+    assert all(t.annotations.idempotent_hint is True for t in tools.values())
     assert tools["subscription_remove"].annotations.destructive_hint is True
     assert tools["ingest"].annotations.destructive_hint is False
+    assert all("feeds.toml" not in (t.description or "") for t in tools.values())
+    assert mcp.instructions and len(mcp.instructions) < 450
+    for name, t in tools.items():
+        for pname, prop in (t.parameters.get("properties") or {}).items():
+            assert prop.get("description"), f"{name}.{pname} missing description"

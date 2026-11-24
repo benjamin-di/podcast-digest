@@ -219,3 +219,76 @@ def test_mcp_archive_status_search_get_and_readonly_wal(tmp_path: Path):
             os.chmod(data_dir, 0o755)
     finally:
         db.close()
+
+
+def test_clean_transcript_passes_show_notes_to_every_chunk():
+    from podcast_digest.summarize import SummarizationInput, clean_transcript
+
+    seen_prompts: list[str] = []
+
+    class FakeCompleter:
+        label = "fake"
+
+        def complete(self, *, system: str, prompt: str, purpose: str, guid: str | None = None, validate=None) -> str:
+            seen_prompts.append(prompt)
+            return "**Jane Doe:** Cleaned chunk."
+
+        def config_problem(self) -> str | None:
+            return None
+
+    inp = SummarizationInput(
+        podcast_name="Macro Pod",
+        title="Liquidity Outlook",
+        published_at="2026-11-21T00:00:00+00:00",
+        duration_seconds=3600,
+        description="<p>Host <b>Alex</b> interviews guest <em>Jane Doe</em> on SOFR.</p>",
+        transcript_text=("alpha " * 300) + ("beta " * 300),
+        segments=[],
+    )
+    md = clean_transcript(inp, completer=FakeCompleter(), max_chunk_chars=1800)
+    assert len(seen_prompts) == 2
+    assert all("Show notes: Host Alex interviews guest Jane Doe on SOFR." in p for p in seen_prompts)
+    assert "**Jane Doe:** Cleaned chunk." in md
+
+
+def test_fts5_search_index_backfill_and_bm25_query(tmp_path: Path):
+    from podcast_digest.pipeline import _backfill_search_index
+
+    data_dir = tmp_path / "data"
+    transcripts = data_dir / "transcripts" / "show--xyz"
+    transcripts.mkdir(parents=True)
+    raw_txt = transcripts / "ep1--abc.txt"
+    clean_md = transcripts / "ep1--abc.clean.md"
+    raw_txt.write_text("raw text", encoding="utf-8")
+    clean_md.write_text(
+        "# Repo Plumbing\n\n**Jane Doe:** Reverse-repo balances dropped below $50B.\n",
+        encoding="utf-8",
+    )
+
+    db = Database(data_dir / "state.db")
+    try:
+        db.upsert_feed(url=FEED_URL, name="Plumbing Weekly")
+        db.insert_episode(
+            feed_url=FEED_URL, guid="ep-fts-1", title="Repo Plumbing",
+            published_at="2026-11-21T00:00:00+00:00", duration_seconds=1800,
+            audio_url="https://cdn.example.com/repo.mp3",
+        )
+        db.set_status(
+            feed_url=FEED_URL, guid="ep-fts-1", status="transcribed",
+            transcript_path=str(raw_txt), segments_path=str(transcripts / "ep1--abc.json"),
+        )
+        db.set_status(
+            feed_url=FEED_URL, guid="ep-fts-1", status="summarized",
+            summary_html="<h2>TL;DR</h2><p>Front-end repo funding tightens.</p>",
+        )
+        _backfill_search_index(db)
+
+        # Punctuation and quotes in user query must never trigger FTS5 syntax errors
+        res = archive.search_transcripts(data_dir, query='reverse-repo "balances"', feed="plumbing")
+        assert res["available"] is True
+        assert res["engine"] == "fts5"
+        assert res["total_matches"] == 1
+        assert res["results"][0]["guid"] == "ep-fts-1"
+        assert res["results"][0]["transcript_kind"] == "cleaned"
+    finally:
+        db.close()

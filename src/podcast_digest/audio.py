@@ -6,9 +6,11 @@ final file that we'd later try to transcribe.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
+from urllib.parse import urljoin
 
 import httpx
 
@@ -21,6 +23,7 @@ from .proc import SubprocessTimeout, run_capture
 logger = logging.getLogger(__name__)
 
 CHUNK = 256 * 1024
+MAX_AUDIO_BYTES = 1024 * 1024 * 1024  # 1 GiB hard ceiling per episode download
 DOWNLOAD_TIMEOUT = httpx.Timeout(60.0, connect=15.0, read=120.0)
 # Some hosts (Substack behind Cloudflare) fingerprint-block httpx's TLS with a
 # 403/429 but serve `curl` fine — same as the RSS fetch in feeds.py.
@@ -28,6 +31,7 @@ CURL_MAX_TIME = "900"
 # Outer wall-clock bound on the curl subprocess: its own --max-time should trip
 # first; this is the kill-if-curl-itself-hangs backstop (a hair over --max-time).
 _CURL_TIMEOUT = 960.0
+_STREAM_DEADLINE_S = 960.0
 _FFPROBE_TIMEOUT = 120.0
 
 
@@ -89,51 +93,81 @@ async def download(
             await active_client.aclose()
 
 
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_MAX_REDIRECTS = 5
+
+
 async def _download_stream(
     client: httpx.AsyncClient, audio_url: str, dest_dir: Path, basename: str,
 ) -> Path:
-    # Always pass our generous DOWNLOAD_TIMEOUT explicitly: the caller's client
-    # typically has a tight default (~30s read) that would trip on an 80MB MP3.
-    async with client.stream(
-        "GET", audio_url, timeout=DOWNLOAD_TIMEOUT, follow_redirects=True,
-    ) as resp:
-        resp.raise_for_status()
-        ext = _ext_from_response(resp)
-        final = dest_dir / f"{basename}{ext}"
-        if await _reusable_cached(final):
-            return final
+    # Always pass our generous DOWNLOAD_TIMEOUT explicitly and follow validated
+    # redirects without buffering intermediate redirect bodies. Bound the entire
+    # download with asyncio.timeout so slow trickle reads cannot hold the tick.
+    current = audio_url
+    try:
+        async with asyncio.timeout(_STREAM_DEADLINE_S):
+            for hop in range(_MAX_REDIRECTS + 1):
+                await validate_outbound_url_async(current)
+                async with client.stream(
+                    "GET", current, timeout=DOWNLOAD_TIMEOUT, follow_redirects=False,
+                ) as resp:
+                    location = resp.headers.get("location")
+                    if resp.status_code in _REDIRECT_STATUSES and location:
+                        if hop >= _MAX_REDIRECTS:
+                            raise RuntimeError(f"too many redirects downloading {audio_url}")
+                        current = urljoin(current, location)
+                        continue
+                    resp.raise_for_status()
+                    ext = _ext_from_response(resp)
+                    final = dest_dir / f"{basename}{ext}"
+                    if await _reusable_cached(final):
+                        return final
 
-        partial = dest_dir / f"{basename}{ext}.partial"
-        total = int(resp.headers.get("content-length") or 0)
-        written = 0
-        try:
-            with partial.open("wb") as f:
-                async for chunk in resp.aiter_bytes(CHUNK):
-                    f.write(chunk)
-                    written += len(chunk)
-            # Truncation detection: a TCP close mid-stream is silent in httpx.
-            # We treat any positive content-length mismatch as a hard error
-            # so we don't summarize half an episode.
-            if total > 0 and written < total:
-                raise RuntimeError(
-                    f"truncated download: got {written} of {total} bytes "
-                    f"from {audio_url}"
-                )
-            # Never publish bytes that don't decode as media: a 200 can still
-            # be an interstitial/error page, and a poisoned final file would
-            # be picked up by the cached-file check and re-fed to
-            # transcription on every retry until the episode drops.
-            await verify_media(partial, source=audio_url)
-            os.replace(partial, final)
-        except BaseException:
-            # On any failure (truncation, cancellation, IO error) drop the
-            # partial so the next retry starts clean.
-            partial.unlink(missing_ok=True)
-            raise
-        logger.info(
-            "audio.downloaded path=%s bytes=%d expected=%d", final, written, total
-        )
-        return final
+                    partial = dest_dir / f"{basename}{ext}.partial"
+                    total = int(resp.headers.get("content-length") or 0)
+                    if total > MAX_AUDIO_BYTES:
+                        raise RuntimeError(
+                            f"audio download exceeds {MAX_AUDIO_BYTES} byte limit "
+                            f"(Content-Length={total}) for {audio_url}"
+                        )
+                    written = 0
+                    try:
+                        with partial.open("wb") as f:
+                            async for chunk in resp.aiter_bytes(CHUNK):
+                                written += len(chunk)
+                                if written > MAX_AUDIO_BYTES:
+                                    raise RuntimeError(
+                                        f"audio download exceeded {MAX_AUDIO_BYTES} byte limit for {audio_url}"
+                                    )
+                                f.write(chunk)
+                        # Truncation detection: a TCP close mid-stream is silent in httpx.
+                        # We treat any positive content-length mismatch as a hard error
+                        # so we don't summarize half an episode.
+                        if total > 0 and written < total:
+                            raise RuntimeError(
+                                f"truncated download: got {written} of {total} bytes "
+                                f"from {audio_url}"
+                            )
+                        # Never publish bytes that don't decode as media: a 200 can still
+                        # be an interstitial/error page, and a poisoned final file would
+                        # be picked up by the cached-file check and re-fed to
+                        # transcription on every retry until the episode drops.
+                        await verify_media(partial, source=audio_url)
+                        os.replace(partial, final)
+                    except BaseException:
+                        # On any failure (truncation, cancellation, IO error) drop the
+                        # partial so the next retry starts clean.
+                        partial.unlink(missing_ok=True)
+                        raise
+                    logger.info(
+                        "audio.downloaded path=%s bytes=%d expected=%d", final, written, total
+                    )
+                    return final
+    except TimeoutError as exc:
+        raise RuntimeError(
+            f"audio download exceeded {_STREAM_DEADLINE_S:.0f}s wall-clock limit for {audio_url}"
+        ) from exc
+    raise RuntimeError(f"too many redirects downloading {audio_url}")
 
 
 async def _download_curl(
@@ -154,6 +188,7 @@ async def _download_curl(
         await fetch_to_file(
             audio_url, dest=partial, user_agent=USER_AGENT,
             max_time=CURL_MAX_TIME, timeout=_CURL_TIMEOUT, label="curl audio",
+            max_bytes=MAX_AUDIO_BYTES,
         )
         if not partial.exists() or partial.stat().st_size == 0:
             raise RuntimeError(

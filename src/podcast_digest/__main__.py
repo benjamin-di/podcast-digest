@@ -120,6 +120,10 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     settings.ensure_dirs()
     mailer = _startup(settings, need_mail=not args.dry_run)
     feeds_file = load_feeds(settings.PODCAST_DIGEST_CONFIG)
+    if args.feed and not any(f.name == args.feed for f in feeds_file.feeds):
+        available = ", ".join(f.name for f in feeds_file.feeds) or "(none)"
+        print(f"podcast-digest: unknown --feed {args.feed!r}; configured: {available}", file=sys.stderr)
+        return 2
     db = Database(settings.db_path)
     try:
         stats = await run_tick(
@@ -127,10 +131,11 @@ async def _cmd_run(args: argparse.Namespace) -> int:
             db=db, mailer=mailer, dry_run=args.dry_run, only_feed=args.feed,
         )
         logger.info(
-            "run.done feeds=%d new=%d emailed=%d failed=%d",
-            stats["feeds"], stats["new_episodes"], stats["emailed"], stats["failed"],
+            "run.done feeds=%d new=%d emailed=%d failed=%d feed_failed=%d",
+            stats["feeds"], stats["new_episodes"], stats["emailed"],
+            stats["failed"], stats.get("feed_failed", 0),
         )
-        return 0 if stats["failed"] == 0 else 1
+        return 0 if stats["failed"] == 0 and stats.get("feed_failed", 0) == 0 else 1
     finally:
         db.close()
 
@@ -177,8 +182,10 @@ async def _cmd_delivery(args: argparse.Namespace) -> int:
     settings = Settings()  # type: ignore[call-arg]
     logmod.configure(settings.LOG_LEVEL)
     settings.ensure_dirs()
-    lock = _acquire_tick_lock(settings)
-    if lock is None:
+    # Read-only inspection does not mutate state and should not block on an
+    # active tick; only reconcile requires the single-writer tick lock.
+    lock = _acquire_tick_lock(settings) if args.action == "reconcile" else None
+    if args.action == "reconcile" and lock is None:
         print("another tick or recovery command is running; try later", file=sys.stderr)
         return 1
     try:
@@ -214,7 +221,8 @@ async def _cmd_delivery(args: argparse.Namespace) -> int:
         finally:
             db.close()
     finally:
-        lock.close()
+        if lock is not None:
+            lock.close()
 
 
 def main(argv: list[str] | None = None) -> int:

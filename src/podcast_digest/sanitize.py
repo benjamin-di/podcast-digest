@@ -30,6 +30,7 @@ def sanitize_summary_html(html: str) -> str:
         html,
         tags=SUMMARY_ALLOWED_TAGS,
         attributes=SUMMARY_ALLOWED_ATTRS,
+        clean_content_tags={"script", "style", "head", "title"},
         url_schemes=set(HTTP_SCHEMES),
         link_rel="noopener noreferrer",
     )

@@ -7,6 +7,7 @@ that's halfway through transcription isn't left in 'downloaded' status.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import random
 import signal
@@ -54,7 +55,10 @@ async def run_forever(settings: Settings, db: Database, mailer: Mailer) -> None:
             event(logger, logging.ERROR, "scheduler.config_error",
                   exc_info=True, **err_fields(e))
             # Wait a minute and try again — bad config shouldn't kill the loop.
-            await _wait_for_next_tick(60, stop, settings, last_wake)
+            # Pass max(last_wake, pending_wake) so an already-pending wake does
+            # not immediately return and busy-loop on the same broken file; a
+            # *newer* wake (after the user fixes feeds.toml) still wakes early.
+            await _wait_for_next_tick(60, stop, settings, max(last_wake, pending_wake))
             continue
 
         event(
@@ -93,10 +97,20 @@ async def run_forever(settings: Settings, db: Database, mailer: Mailer) -> None:
             await _ping_heartbeat(settings.PODCAST_DIGEST_HEARTBEAT_URL)
 
         # Consume the signal once a tick actually ran (success or error). Only a
-        # lock-skip leaves it unconsumed, so it retries on the next short poll
+        # lock-skip leaves it unconsumed, so it retries after a brief backoff
         # rather than busy-looping or being lost.
         if not skipped:
             last_wake = max(last_wake, pending_wake)
+
+        if skipped and pending_wake > last_wake:
+            # Another tick held the lock while a wake was pending: wait briefly
+            # before re-trying so we don't spin on the lock file.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=max(1.0, settings.PODCAST_DIGEST_WAKE_POLL_SECONDS),
+                )
+            continue
 
         sleep_for = feeds_file.poll_seconds + random.uniform(0, JITTER_SECONDS)
         event(logger, logging.INFO, "tick.sleep", seconds=round(sleep_for))

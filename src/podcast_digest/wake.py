@@ -24,6 +24,7 @@ keeps it untracked — the sentinel is pure ephemeral local IPC.
 from __future__ import annotations
 
 import os
+import secrets
 import time
 from pathlib import Path
 
@@ -40,13 +41,21 @@ def wake_path(config_file: Path | str) -> Path:
 def signal_wake(config_file: Path | str) -> int:
     """Bump the sentinel to a fresh monotonic-ish token. Returns the token.
 
-    Atomic (tempfile + os.replace) so the scheduler never reads a torn value.
+    Atomic (unique tempfile + os.replace) so concurrent callers never race and
+    the scheduler never reads a torn value.
     """
     p = wake_path(config_file)
+    p.parent.mkdir(parents=True, exist_ok=True)
     token = time.time_ns()
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(str(token), encoding="utf-8")
-    os.replace(tmp, p)
+    tmp = p.parent / f".{p.name}.{secrets.token_hex(8)}.tmp"
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(str(token))
+        os.replace(tmp, p)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return token
 
 

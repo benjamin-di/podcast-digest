@@ -15,16 +15,17 @@ class SubprocessTimeout(RuntimeError):
     pass
 
 
-def _kill_group(proc: asyncio.subprocess.Process) -> None:
-    if proc.returncode is not None:
+def _kill_group(proc: asyncio.subprocess.Process, *, force_group: bool = False) -> None:
+    if not force_group and proc.returncode is not None:
         return
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
     except PermissionError:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
 
 
 async def run_capture(
@@ -41,15 +42,18 @@ async def run_capture(
         env=env,
         start_new_session=True,
     )
+    completed = False
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        completed = True
     except TimeoutError:
         logger.warning("proc.timeout label=%s timeout_s=%s cmd=%s", label, timeout, cmd[0])
         raise SubprocessTimeout(f"{label} timed out after {timeout}s") from None
     finally:
-        if proc.returncode is None:
-            _kill_group(proc)
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(proc.wait(), timeout=10)
+        if not completed:
+            _kill_group(proc, force_group=True)
+            if proc.returncode is None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(proc.wait(), timeout=10)
     assert proc.returncode is not None
     return proc.returncode, stdout, stderr

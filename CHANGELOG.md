@@ -1,5 +1,64 @@
 # Changelog
 
+## [1.7.1] - 2026-11-24
+
+### Fixed
+
+- Update `README.md` with `PODCAST_DIGEST_MODEL_EFFORT` (`1.6.0`), `ingest(min_minutes=0)`, FTS5/CJK `search_transcripts`, and `get_episode(feed=...)`.
+- Allowlist the synthetic test key assertion in `tests/test_summarize.py` in `publish/config.toml` so public mirror exports pass secret scanning cleanly.
+
+### Upgrade
+
+- Action required: none.
+- Rollback: compatible with 1.7.0. Existing databases, delivery journals, and transcripts remain readable.
+
+## [1.7.0] - 2026-11-23
+
+### Changed
+
+- Upgrade digest emails to full HTML documents with `<head>`, `color-scheme` meta tags, hidden TL;DR preheader, MSO table wrapper, inline summary styles, HTMLParser-based YouTube timestamp deep links, deduplicated one-shot subjects/eyebrows, YouTube CTA label, improved WCAG light-mode footer contrast, and cleaner plain-text link/separator rendering.
+
+### Fixed
+
+- Create staged transcript, wake, and feed files with kernel-applied umask (preserving existing `feeds.toml` mode before writing) so non-root `podcast-digest-mcp` can read published transcripts without loosening private permissions.
+- Refuse HTTP redirects on webhook POSTs to prevent `Authorization` disclosure and false delivery confirmation, and bound webhook/feed/audio response sizes and stream deadlines across explicit validated redirect hops.
+- Normalize multiline/long email subjects, classify local SMTP `EmailMessage` preparation failures as proven non-submissions (`MailError`), and sanitize CR/Unicode line separators in `emitted.tsv`.
+- Filter known-short and enriched-short YouTube channel teasers before cap-1 selection so qualifying episodes behind them are not pre-suppressed.
+- Fix MCP `search_transcripts` uncapped FTS5 `total_matches`, CJK substring fallback (including indexed transcripts), quoted phrase handling, highlight-driven snippets, `LIKE` wildcard escaping, and `get_episode` exact-first Unicode feed disambiguation.
+- Cache refcounted read-only SQLite WAL snapshots in `podcast-digest-mcp` (copying only `state.db` + `-wal`, never `-shm`), validate `feeds.toml` with `FeedsFile` before atomic writes, support explicit `min_minutes=0` opt-out, canonicalize/deduplicate YouTube video URLs, and return structured errors from `ingest`/`preview`.
+- Fix Dockerfile healthchecks to match `bin/podcast-digest serve|podcast_digest serve` via exec form, eliminate quadratic FTS5 backfill scans via `search_indexed_at`, cache local-transcriber model SHA-256 digests with file-identity validation, preserve Unicode attachment filenames, and harden subprocess group cleanup, publisher transcript validation, command-backend JSON parsing, and scheduler wake backoff.
+
+### Upgrade
+
+- Action required: none. Existing databases gain the nullable `episodes.search_indexed_at` column automatically on startup.
+- Rollback: compatible with 1.6.0. Existing databases, delivery journals, and transcripts remain readable.
+
+## [1.6.0] - 2026-11-23
+
+### Added
+
+- Add `PODCAST_DIGEST_MODEL_EFFORT` (`low`, `medium`, `high`) to forward Anthropic Messages `output_config.effort` for API summarization and transcript cleanup.
+- Require physical observed `response.model` provenance (rejecting missing or unexpanded alias names as unusable replies) and log the served model when calling `fleet-*` aliases through an Anthropic-compatible proxy.
+
+### Upgrade
+
+- Action required: none. Existing physical `PODCAST_DIGEST_MODEL` configurations continue unchanged.
+- Rollback: compatible with 1.5.0. Existing databases, delivery journals and transcripts remain readable.
+
+## [1.5.0] - 2026-11-21
+
+### Added
+
+- Pass trimmed episode show notes into every parallel `clean_transcript` chunk so host/guest names and terminology stay consistent across chunk boundaries without sacrificing parallelism.
+- Index episode shows, titles, summaries, and transcripts in a SQLite FTS5 (`episode_search`) virtual table with automatic backfill and BM25 ranking in `podcast-digest-mcp` `search_transcripts` (with transparent linear-scan fallback).
+- Allow read-only `podcast-digest delivery list` and `delivery inspect` commands to run without blocking on an active tick's writer lock.
+- Migrate `v*.*.*` tag publication to a native Jenkins pipeline (`.github/jenkins/Jenkinsfile`, `.github/jenkins/ci-release.sh`, `.github/jenkins/ci-registry.sh`) preserving `local-transcriber` -> `podcast-digest` digest chaining, provenance/SBOM attestations, exact-digest smoke checks, and all-or-nothing preflight before tag promotion.
+
+### Upgrade
+
+- Action required: none. Existing episodes are indexed into `episode_search` automatically on the next tick.
+- Rollback: compatible with 1.4.x. Existing databases, delivery journals and transcripts remain readable.
+
 ## [1.4.2] - 2026-11-21
 
 ### Fixed
@@ -123,6 +182,7 @@
 - Action required: none.
 - Rollback: compatible with 0.4.6. New consumers requiring full OCI provenance must retain 0.4.7 or newer.
 
+[1.5.0]: https://github.com/benjamin-di/podcast-digest/releases/tag/v1.5.0
 [1.4.0]: https://github.com/benjamin-di/podcast-digest/releases/tag/v1.4.0
 [1.3.0]: https://github.com/benjamin-di/podcast-digest/releases/tag/v1.3.0
 [1.2.1]: https://github.com/benjamin-di/podcast-digest/releases/tag/v1.2.1

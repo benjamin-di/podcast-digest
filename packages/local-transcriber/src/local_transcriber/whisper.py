@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import sys
 import tempfile
@@ -86,12 +87,38 @@ def _validate_artifact_id(value: str) -> str:
     return value
 
 
+_MODEL_HASH_CACHE: dict[tuple[str, int, int, int, int, int], str] = {}
+
+
 def _hash_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _model_stat_key(path: Path) -> tuple[str, int, int, int, int, int]:
+    st = path.stat()
+    return (
+        str(path.resolve()), st.st_dev, st.st_ino,
+        st.st_ctime_ns, st.st_mtime_ns, st.st_size,
+    )
+
+
+def _hash_model_file(path: Path) -> str:
+    """Hash a model asset, reusing the digest while its file identity is unchanged."""
+    for _ in range(3):
+        before = _model_stat_key(path)
+        cached = _MODEL_HASH_CACHE.get(before)
+        if cached is not None:
+            return cached
+        digest = _hash_file(path)
+        after = _model_stat_key(path)
+        if after == before:
+            _MODEL_HASH_CACHE[before] = digest
+            return digest
+    raise TranscriptionError(f"model file changed during hashing: {path}")
 
 
 def _prompt_sha256(prompt: str | None) -> str | None:
@@ -108,10 +135,11 @@ def _atomic_publish(src: Path, dst: Path) -> None:
             raise
 
     # A bind-mounted output directory can be a different filesystem from the
-    # work directory. Copy into a hidden file on the destination filesystem,
-    # fsync it, then atomically replace the public path there.
-    fd, raw_staged = tempfile.mkstemp(prefix=f".{dst.name}.", dir=dst.parent)
-    staged = Path(raw_staged)
+    # work directory. Copy into a hidden file on the destination filesystem
+    # created with 0o666 so the kernel applies the process umask consistently
+    # with same-device publication, fsync it, then atomically replace dst.
+    staged = dst.parent / f".{dst.name}.{secrets.token_hex(8)}.tmp"
+    fd = os.open(staged, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
     try:
         with os.fdopen(fd, "wb") as target, src.open("rb") as source:
             shutil.copyfileobj(source, target)
@@ -223,7 +251,7 @@ async def transcribe_file(
             async with _device_lock(config):
                 await _run_whisper(wav_path, output_base=output_base, config=config)
             transcript = load_whisper_json(staged_json, fallback_text_path=staged_txt)
-            model_sha256 = _hash_file(config.model_path)
+            model_sha256 = await asyncio.to_thread(_hash_model_file, config.model_path)
         if not staged_txt.exists():
             staged_txt.write_text(transcript.text, encoding="utf-8")
 
@@ -312,7 +340,7 @@ async def _run_sherpa(
     if rc:
         raise TranscriptionError(f"{engine} inference failed (rc={rc})")
     digests = await asyncio.to_thread(
-        lambda: b"".join(bytes.fromhex(_hash_file(config.model_dir / name)) for name in model_files)
+        lambda: b"".join(bytes.fromhex(_hash_model_file(config.model_dir / name)) for name in model_files)
     )
     return engine_version, hashlib.sha256(digests).hexdigest()
 

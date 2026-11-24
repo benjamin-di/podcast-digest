@@ -370,34 +370,38 @@ class SmtpMailer:
         recipients = [r["emailAddress"]["address"] for r in _recipients(to)]
         if not recipients:
             raise MailError("no valid recipients")
-        msg = EmailMessage()
-        msg["From"] = self.sender
-        msg["To"] = ", ".join(recipients)
-        msg["Subject"] = subject
-        msg["Date"] = date_header or formatdate(usegmt=True)
-        domain = self.sender.rpartition("@")[2] or "localhost"
-        msg["Message-ID"] = (
-            f"<{operation_id}@{domain}>" if operation_id else make_msgid(domain=domain)
-        )
-        if operation_id:
-            msg["X-Podcast-Digest-Operation"] = operation_id
-        if reply_to:
-            msg["Reply-To"] = ", ".join(
-                r["emailAddress"]["address"] for r in _recipients(reply_to)
+        try:
+            msg = EmailMessage()
+            msg["From"] = self.sender
+            msg["To"] = ", ".join(recipients)
+            msg["Subject"] = " ".join(subject.split())
+            msg["Date"] = date_header or formatdate(usegmt=True)
+            domain = self.sender.rpartition("@")[2] or "localhost"
+            msg["Message-ID"] = (
+                f"<{operation_id}@{domain}>" if operation_id else make_msgid(domain=domain)
             )
-        # A plain-text part alongside the HTML: some clients and filters want it.
-        msg.set_content(_html_to_text(body_html))
-        msg.add_alternative(body_html, subtype="html")
-        for a in attachments or []:
-            maintype, _, subtype = a.content_type.split(";", 1)[0].strip().partition("/")
-            msg.add_attachment(
-                a.content,
-                maintype=maintype or "application",
-                subtype=subtype or "octet-stream",
-                filename=a.name,
-            )
+            if operation_id:
+                msg["X-Podcast-Digest-Operation"] = operation_id
+            if reply_to:
+                msg["Reply-To"] = ", ".join(
+                    r["emailAddress"]["address"] for r in _recipients(reply_to)
+                )
+            # A plain-text part alongside the HTML: some clients and filters want it.
+            msg.set_content(_html_to_text(body_html))
+            msg.add_alternative(body_html, subtype="html")
+            for a in attachments or []:
+                maintype, _, subtype = a.content_type.split(";", 1)[0].strip().partition("/")
+                msg.add_attachment(
+                    a.content,
+                    maintype=maintype or "application",
+                    subtype=subtype or "octet-stream",
+                    filename=a.name,
+                )
+            raw_len = len(bytes(msg))
+        except ValueError as e:
+            raise MailError(f"SMTP message preparation failed: {e}") from e
 
-        timeout = upload_timeout(len(bytes(msg)), base=_UPLOAD_TIMEOUT_BASE)
+        timeout = upload_timeout(raw_len, base=_UPLOAD_TIMEOUT_BASE)
         smtp: _SMTP | _SMTP_SSL | None = None
         try:
             # Connect, negotiate TLS, authenticate: nothing is accepted yet.
@@ -442,19 +446,48 @@ class SmtpMailer:
         )
 
 
-_STYLE_BLOCK_RE = re.compile(r"<style[^>]*>.*?</style>", re.IGNORECASE | re.DOTALL)
-_BLOCK_END_RE = re.compile(r"</(p|h[1-6]|li|ul|ol|div|tr)>|<br\s*/?>", re.IGNORECASE)
+_HEAD_BLOCK_RE = re.compile(r"<head[^>]*>.*?</head>", re.IGNORECASE | re.DOTALL)
+_STYLE_BLOCK_RE = re.compile(r"<(style|script)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_PREHEADER_RE = re.compile(
+    r'<div[^>]*class="pd-preheader"[^>]*>.*?</div>', re.IGNORECASE | re.DOTALL,
+)
+_ANCHOR_RE = re.compile(
+    r'<a\b[^>]*\bhref=["\']([^"\']+)["\'][^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL,
+)
+_HR_RE = re.compile(r"<hr\b[^>]*/?>", re.IGNORECASE)
+_LI_OPEN_RE = re.compile(r"\s*<li[^>]*>\s*", re.IGNORECASE)
+_LI_CLOSE_RE = re.compile(r"\s*</li>\s*", re.IGNORECASE)
+_BLOCK_END_RE = re.compile(r"</(p|h[1-6]|ul|ol|div|tr)>|<br\s*/?>", re.IGNORECASE)
 
 
-def _html_to_text(body_html: str) -> str:
+def _html_to_text(body_html: str, *, include_links: bool = True) -> str:
     """A readable plain-text rendering of the digest HTML."""
-    text = _STYLE_BLOCK_RE.sub("", body_html)
-    text = re.sub(r"<li[^>]*>", "- ", text, flags=re.IGNORECASE)
+    text = _HEAD_BLOCK_RE.sub("", body_html)
+    text = _STYLE_BLOCK_RE.sub("", text)
+    text = _PREHEADER_RE.sub("", text)
+    if include_links:
+        def _render_link(m: re.Match[str]) -> str:
+            href = html.unescape(m.group(1)).strip()
+            label = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            if href and label and href not in label and not label.startswith("["):
+                return f"{label} ({href})"
+            return label or href
+        text = _ANCHOR_RE.sub(_render_link, text)
+    text = _HR_RE.sub("\n---\n", text)
+    text = _LI_OPEN_RE.sub("- ", text)
+    text = _LI_CLOSE_RE.sub("\n", text)
     text = _BLOCK_END_RE.sub("\n", text)
     text = re.sub(r"<[^>]+>", "", text)
     text = html.unescape(text)
-    text = re.sub(r"[ \t]+", " ", text)
-    return re.sub(r"\n\s*\n+", "\n\n", text).strip() + "\n"
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in text.splitlines()]
+    out_lines: list[str] = []
+    for ln in lines:
+        if not ln:
+            if out_lines and out_lines[-1] != "":
+                out_lines.append("")
+        else:
+            out_lines.append(ln)
+    return "\n".join(out_lines).strip() + "\n"
 
 
 def build_mailer(settings: Settings) -> Mailer:

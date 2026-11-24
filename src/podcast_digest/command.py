@@ -99,6 +99,8 @@ def _classify_failure(stdout: str) -> tuple[str, bool]:
             evt = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(evt, dict):
+            continue
         if evt.get("type") == "run_failed":
             auth = auth or bool(evt.get("auth_failure", False))
             reason = str(evt.get("reason") or reason)
@@ -134,6 +136,8 @@ def _parse_result(stdout: str) -> str:
         except json.JSONDecodeError:
             # stderr/diagnostics can leak onto stdout in odd cases; skip them.
             continue
+        if not isinstance(evt, dict):
+            continue
         etype = evt.get("type")
         if etype == "run_failed":
             reason, auth = _classify_failure(stdout)
@@ -144,12 +148,13 @@ def _parse_result(stdout: str) -> str:
             )
         if etype == "result":
             if evt.get("is_error"):
-                error_text = str(evt.get("text", "")) or error_text or ""
+                raw_err = evt.get("text")
+                error_text = str(raw_err) if raw_err is not None and str(raw_err) else (error_text or "")
                 continue
             # Keep the last non-empty non-error result. `.strip()` so a
             # whitespace-only later result can't clobber a real earlier one.
-            text = evt.get("text", "")
-            if text.strip():
+            text = evt.get("text")
+            if isinstance(text, str) and text.strip():
                 result_text = text
     if result_text:
         return result_text

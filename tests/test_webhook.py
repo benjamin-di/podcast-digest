@@ -56,7 +56,7 @@ def _capture(monkeypatch, body: bytes = b'{"task_id": "task-789"}') -> dict:
         captured["timeout"] = timeout
         return _FakeResp(body)
 
-    monkeypatch.setattr(webhook.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(webhook, "_open", fake_urlopen)
     return captured
 
 
@@ -100,7 +100,7 @@ def test_push_raises_on_http_error(monkeypatch):
     def fake_urlopen(req, timeout=None):
         raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", hdrs=None, fp=None)
 
-    monkeypatch.setattr(webhook.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(webhook, "_open", fake_urlopen)
     with pytest.raises(WebhookError, match="HTTP 401"):
         _client().push(_episode())
 
@@ -109,7 +109,7 @@ def test_push_raises_on_network_error(monkeypatch):
     def fake_urlopen(req, timeout=None):
         raise urllib.error.URLError("connection refused")
 
-    monkeypatch.setattr(webhook.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(webhook, "_open", fake_urlopen)
     with pytest.raises(WebhookError, match="request failed"):
         _client().push(_episode())
 

@@ -218,18 +218,22 @@ class ApiCompleter:
         *,
         model: str,
         provider: Literal["auto", "anthropic", "openai"] = "auto",
+        effort: str = "",
         anthropic_api_key: str = "",
         openai_api_key: str = "",
         openai_base_url: str = "",
     ) -> None:
         self.model = model
         self.provider = provider_for_model(model) if provider == "auto" else provider
+        self.effort = effort.strip()
         self.anthropic_api_key = anthropic_api_key
         self.openai_api_key = openai_api_key
         self.openai_base_url = openai_base_url.strip()
         self.label = f"{self.provider}:{model}"
 
     def config_problem(self) -> str | None:
+        if self.effort and self.effort not in {"low", "medium", "high"}:
+            return f"invalid model effort {self.effort!r} (expected low, medium, or high)"
         if self.provider == "anthropic" and not self.anthropic_api_key:
             return f"model {self.model!r} needs ANTHROPIC_API_KEY (not set)"
         if self.provider == "openai" and not (self.openai_api_key or self.openai_base_url):
@@ -284,23 +288,33 @@ class ApiCompleter:
         from anthropic import Anthropic
 
         client = Anthropic(api_key=self.anthropic_api_key)
-        resp = client.messages.create(
-            model=self.model,
-            max_tokens=budget,
+        kwargs: dict[str, object] = {
+            "model": self.model,
+            "max_tokens": budget,
             # No `thinking` option: current models reject disabling it, and the
             # default (adaptive) is right for every model. Its tokens share
             # max_tokens, which is sized for that.
             # The system prompt is byte-identical across episodes: cache it.
-            system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-            messages=[{"role": "user", "content": prompt}],
-        )
+            "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if self.effort:
+            kwargs["extra_body"] = {"output_config": {"effort": self.effort}}
+        resp = client.messages.create(**kwargs)  # type: ignore[call-overload]
         if getattr(resp, "stop_reason", None) == "refusal":
             # The model declined (a safety classifier, rarely triggered by a
             # podcast). Retried once; persistent refusals fail the episode.
             raise UnusableReply(f"{self.label} declined the request (refusal)")
+        served = getattr(resp, "model", None)
+        if self.model.startswith("fleet-") and (
+            not isinstance(served, str) or not served.strip() or served.strip().startswith("fleet-")
+        ):
+            raise UnusableReply(f"{self.label} did not identify the model actually served")
         text = "".join(b.text for b in resp.content if b.type == "text").strip()
         logger.info(
-            "llm.done provider=anthropic input_tokens=%d output_tokens=%d cache_read=%d",
+            "llm.done provider=anthropic requested=%s served=%s input_tokens=%d output_tokens=%d cache_read=%d",
+            self.model,
+            served if isinstance(served, str) and served.strip() else "unknown",
             resp.usage.input_tokens,
             resp.usage.output_tokens,
             getattr(resp.usage, "cache_read_input_tokens", 0) or 0,
@@ -382,6 +396,7 @@ def build_completer(settings: Settings) -> Completer:
     return ApiCompleter(
         model=settings.PODCAST_DIGEST_MODEL,
         provider=settings.PODCAST_DIGEST_PROVIDER,
+        effort=settings.PODCAST_DIGEST_MODEL_EFFORT,
         anthropic_api_key=settings.ANTHROPIC_API_KEY,
         openai_api_key=settings.OPENAI_API_KEY,
         openai_base_url=settings.PODCAST_DIGEST_OPENAI_BASE_URL,

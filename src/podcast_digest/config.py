@@ -221,6 +221,7 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     OPENAI_API_KEY_FILE: Path | None = None
     PODCAST_DIGEST_MODEL: str = "claude-opus-5-5"
+    PODCAST_DIGEST_MODEL_EFFORT: Literal["", "low", "medium", "high"] = ""
     PODCAST_DIGEST_PROVIDER: Literal["auto", "anthropic", "openai"] = "auto"
     PODCAST_DIGEST_OPENAI_BASE_URL: str = ""
 

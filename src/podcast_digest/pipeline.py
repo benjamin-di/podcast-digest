@@ -8,9 +8,10 @@ import hashlib
 import logging
 import os
 import re
-import tempfile
+import secrets
 import unicodedata
 from datetime import UTC, datetime, timedelta
+from html.parser import HTMLParser
 from pathlib import Path
 
 import httpx
@@ -47,7 +48,7 @@ from .feeds import (
 from .identity import BUILD, BuildIdentity
 from .llm import SummarizerUnavailable, build_completer
 from .log import err_fields, event
-from .mail import MailAttachment, Mailer
+from .mail import MailAttachment, Mailer, _html_to_text
 from .net import build_async_client
 from .sanitize import safe_listen_url, sanitize_summary_html
 from .summarize import SummarizationInput, clean_transcript, summarize
@@ -194,6 +195,7 @@ async def _run_tick_locked(
                 stats["emailed"] += emailed
                 stats["failed"] += failed
             except Exception as e:  # noqa: BLE001
+                stats["feed_failed"] = stats.get("feed_failed", 0) + 1
                 event(logger, logging.ERROR, "feed.failed",
                       feed=feed.name, exc_info=True, **err_fields(e))
                 # Best-effort: feed_url may be unknown if resolution failed.
@@ -207,6 +209,8 @@ async def _run_tick_locked(
             "tick.webhook pushed=%d failed=%d",
             stats["webhook_pushed"], stats["webhook_failed"],
         )
+    if not dry_run:
+        _backfill_search_index(db)
     return stats
 
 
@@ -241,6 +245,8 @@ async def _process_feed(
         if known_identity is None:
             raise
         identity_url = known_identity
+        if stats is not None:
+            stats["feed_failed"] = stats.get("feed_failed", 0) + 1
         event(
             logger, logging.ERROR, "feed.failed",
             feed=feed.name, source=identity_url, exc_info=True,
@@ -541,6 +547,7 @@ async def _enrich_new_youtube(
     db: Database,
     cookies: str | None,
     limit: int = MAX_NEW_PER_TICK,
+    min_minutes: int = 0,
 ) -> list[EpisodeMeta]:
     """Replace flat-enumeration metadata with authoritative metadata for the
     newest *unseen* uploads.
@@ -550,8 +557,9 @@ async def _enrich_new_youtube(
     date via `single_video_episode` until `limit` viable unseen candidates are
     selected — which is all the pipeline will emit this tick — and leave the
     remaining back-catalog on cheap flat metadata (it's suppressed, never
-    shown). Failed durationless/live candidates are dropped without consuming
-    that selection budget; other per-video failures degrade to flat metadata.
+    shown). Failed durationless/live candidates and enriched uploads shorter
+    than ``min_minutes`` are dropped without consuming that selection budget;
+    other per-video failures degrade to flat metadata.
     """
     selected = 0
     out: list[EpisodeMeta] = []
@@ -562,9 +570,16 @@ async def _enrich_new_youtube(
         # newest VOD behind it unvalidated.
         if selected < limit and not db.has_episode(feed_url, meta.guid):
             try:
-                out.append(
-                    await youtube.single_video_episode(meta.audio_url, cookies=cookies)
+                enriched = await youtube.single_video_episode(
+                    meta.audio_url, cookies=cookies,
                 )
+                if (
+                    min_minutes
+                    and enriched.duration_seconds is not None
+                    and enriched.duration_seconds < min_minutes * 60
+                ):
+                    continue
+                out.append(enriched)
                 selected += 1
                 continue
             except youtube.FeedError as e:
@@ -669,8 +684,17 @@ async def _discover_episodes(
             resolve=_resolve_yt,
             fetch=lambda url: youtube.list_channel_uploads(url, cookies=cookies),
         )
+        # Filter known-short channel uploads before enrichment and cap assignment
+        # so a 30s teaser cannot consume the cap-1 slot and pre-suppress the real
+        # qualifying episode behind it.
+        if min_minutes:
+            episodes = [
+                ep for ep in episodes
+                if ep.duration_seconds is None or ep.duration_seconds >= min_minutes * 60
+            ]
         episodes = await _enrich_new_youtube(
-            episodes, feed_url=feed_url, db=db, cookies=cookies, limit=max_new_per_tick,
+            episodes, feed_url=feed_url, db=db, cookies=cookies,
+            limit=max_new_per_tick, min_minutes=min_minutes,
         )
         return feed_url, None, episodes
 
@@ -1027,19 +1051,19 @@ async def _advance_episode(
     attachments: list[MailAttachment] = []
     cleaned_md: str | None = None
     attach_mode = settings.PODCAST_DIGEST_ATTACH_TRANSCRIPT
-    can_attach = (
-        not dry_run
-        and stage_lt(ep.status, "emailed")
+    has_transcript_file = (
+        stage_lt(ep.status, "emailed")
         and transcript_path is not None
         and Path(transcript_path).exists()
     )
+    can_attach = not dry_run and has_transcript_file
 
     if attach_mode == "raw" and can_attach:
         assert transcript_path is not None
         tpath = Path(transcript_path)
         try:
             attachments.append(MailAttachment(
-                name=f"{_safe_basename(ep.title)}.txt",
+                name=_attachment_filename(ep.title, ".txt"),
                 content=tpath.read_bytes(),
                 content_type="text/plain; charset=utf-8",
             ))
@@ -1053,9 +1077,12 @@ async def _advance_episode(
         tpath = Path(transcript_path)
         clean_path = tpath.with_suffix(".clean.md")
         # Ensure the cleaned transcript exists — but only while we can still feed
-        # it to the summary (before `summarized`). Defer (don't advance) on a
-        # transient failure; degrade once the per-episode budget is spent.
-        if not _is_nonempty_file(clean_path) and stage_lt(ep.status, "summarized"):
+        # it to the summary (before `summarized`) and within CLEAN_MAX_TICKS.
+        if (
+            not _is_nonempty_file(clean_path)
+            and stage_lt(ep.status, "summarized")
+            and ep.clean_attempts < CLEAN_MAX_TICKS
+        ):
             is_final = ep.clean_attempts + 1 >= CLEAN_MAX_TICKS
             try:
                 if transcript is None:
@@ -1103,11 +1130,12 @@ async def _advance_episode(
         # Attach the cleaned transcript if we have one (this tick or a prior one).
         if _is_nonempty_file(clean_path):
             cleaned_md = clean_path.read_text(encoding="utf-8")
-            attachments.append(MailAttachment(
-                name=f"{_safe_basename(ep.title)}.md",
-                content=clean_path.read_bytes(),
-                content_type="text/markdown; charset=utf-8",
-            ))
+            if can_attach:
+                attachments.append(MailAttachment(
+                    name=_attachment_filename(ep.title, ".md"),
+                    content=cleaned_md.encode("utf-8"),
+                    content_type="text/markdown; charset=utf-8",
+                ))
 
     # ---- 3b. Summarize (prefer the cleaned transcript when available)
     summary_html = ep.summary_html
@@ -1166,6 +1194,17 @@ async def _advance_episode(
             feed_url=ep.feed_url, guid=ep.guid,
             status="summarized", summary_html=summary_html,
             summary_build=summary_build,
+        )
+        _index_episode_for_search(
+            db,
+            feed_url=ep.feed_url,
+            guid=ep.guid,
+            show=feed.display_show,
+            title=ep.title,
+            summary_html=summary_html,
+            transcript_text=cleaned_md or (
+                transcript.text if transcript is not None else _read_transcript_for_webhook(ep) or ""
+            ),
         )
         if stats is not None:
             stats["summarize_ok"] = stats.get("summarize_ok", 0) + 1
@@ -1362,6 +1401,58 @@ async def _sweep_webhook_pushes(
             )
 
 
+def _index_episode_for_search(
+    db: Database,
+    *,
+    feed_url: str,
+    guid: str,
+    show: str,
+    title: str,
+    summary_html: str | None,
+    transcript_text: str,
+) -> None:
+    """Best-effort FTS5 index update; never blocks or fails the digest pipeline."""
+    try:
+        db.upsert_search_index(
+            feed_url=feed_url,
+            guid=guid,
+            show=show,
+            title=title,
+            summary_text=(
+                _html_to_text(summary_html, include_links=False).strip()
+                if summary_html else ""
+            ),
+            transcript_text=transcript_text,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("search.index_failed guid=%r err=%s", guid, exc)
+
+
+def _backfill_search_index(db: Database) -> None:
+    """Populate episode_search for any historical episodes not yet indexed."""
+    try:
+        pending = db.unindexed_searchable_episodes()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("search.backfill_failed err=%s", exc)
+        return
+    if not pending:
+        return
+    try:
+        with db.tx():
+            for ep, show in pending:
+                _index_episode_for_search(
+                    db,
+                    feed_url=ep.feed_url,
+                    guid=ep.guid,
+                    show=show,
+                    title=ep.title,
+                    summary_html=ep.summary_html,
+                    transcript_text=_read_transcript_for_webhook(ep) or "",
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("search.backfill_tx_failed err=%s", exc)
+
+
 def _read_transcript_for_webhook(ep: EpisodeRow) -> str | None:
     """The push payload transcript: prefer the cleaned `.clean.md` (speaker
     labels + timestamps), fall back to the raw `.txt`. None if neither is on
@@ -1428,6 +1519,22 @@ def _safe_basename(guid: str) -> str:
     return cleaned or "episode"
 
 
+def _attachment_filename(title: str, ext: str) -> str:
+    """Human-readable, filesystem-safe attachment filename truncated at word boundaries.
+
+    Preserves Unicode letters and digits (e.g. CJK titles) while collapsing
+    punctuation and whitespace into single hyphens.
+    """
+    raw = "".join(c if c.isalnum() else "-" for c in title)
+    collapsed = re.sub(r"-+", "-", raw).strip("-")
+    if len(collapsed) > 80:
+        cut = collapsed[:80]
+        if "-" in cut:
+            cut = cut.rsplit("-", 1)[0]
+        collapsed = cut.rstrip("-") or collapsed[:80]
+    return f"{collapsed or 'episode'}{ext}"
+
+
 def _artifact_key(guid: str) -> str:
     """Collision-resistant ASCII artifact id accepted by local-transcriber."""
     ascii_guid = unicodedata.normalize("NFKD", guid).encode(
@@ -1435,8 +1542,10 @@ def _artifact_key(guid: str) -> str:
     ).decode("ascii")
     readable = "".join(
         c if c.isalnum() or c in "-_" else "-" for c in ascii_guid
-    ).strip("-")
+    ).lstrip("-_").rstrip("-")
     readable = (readable or "episode")[:64].rstrip("-") or "episode"
+    if not readable[0].isalnum():
+        readable = "episode"
     digest = hashlib.sha256(guid.encode("utf-8")).hexdigest()[:32]
     return f"{readable}--{digest}"
 
@@ -1462,12 +1571,14 @@ def _is_nonempty_file(path: Path) -> bool:
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
-    """Durably publish UTF-8 text without exposing a partial final file."""
+    """Durably publish UTF-8 text without exposing a partial final file.
+
+    Uses ``os.open(..., O_CREAT | O_EXCL | O_WRONLY, 0o666)`` so the kernel
+    applies the process umask atomically without mutating process-wide state.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
-    )
-    tmp_path = Path(tmp_name)
+    tmp_path = path.parent / f".{path.name}.{secrets.token_hex(8)}.tmp"
+    fd = os.open(tmp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(content)
@@ -1503,9 +1614,22 @@ def _fmt_release_date(published_at: str | None) -> str:
     return dt.strftime("%-d %b %Y")
 
 
+_MAX_SUBJECT_LEN = 240
+
+
 def _build_subject(podcast: str, title: str, duration: int | None) -> str:
+    clean_podcast = " ".join(podcast.split())
+    clean_title = " ".join(title.split())
     dur = _fmt_duration(duration)
-    return f"[Podcast] {podcast} — {title}{f' ({dur})' if dur else ''}"
+    suffix = f" ({dur})" if dur else ""
+    if not clean_podcast or clean_podcast.casefold() == clean_title.casefold():
+        base = f"[Podcast] {clean_title}"
+    else:
+        base = f"[Podcast] {clean_podcast} — {clean_title}"
+    budget = _MAX_SUBJECT_LEN - len(suffix)
+    if len(base) > budget:
+        base = base[: max(1, budget - 1)].rstrip() + "…"
+    return f"{base}{suffix}"
 
 
 # Display names for the language codes we expect to see in feeds.toml; any
@@ -1523,11 +1647,13 @@ _LANGUAGE_NAMES = {
 }
 
 
-_YOUTUBE_TS_RE = re.compile(r"<strong>\[(\d{2}):(\d{2}):(\d{2})\]</strong>")
+_YOUTUBE_TS_TEXT_RE = re.compile(r"\[(?:(\d{1,2}):)?(\d{2}):(\d{2})\]")
 
 _EMAIL_STYLE = (
     "<style>"
-    ".pd-wrap{max-width:680px;margin:0 auto;font-family:-apple-system,BlinkMacSystemFont,"
+    ":root{color-scheme:light dark;supported-color-schemes:light dark;}"
+    "body{margin:0;padding:0;}"
+    ".pd-wrap{max-width:680px;margin:0 auto;padding:16px;font-family:-apple-system,BlinkMacSystemFont,"
     "'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.6;color:#1f2937;}"
     ".pd-body h2{font-size:16px;font-weight:700;margin:22px 0 8px 0;padding-bottom:4px;"
     "border-bottom:1px solid #e5e7eb;}"
@@ -1537,8 +1663,9 @@ _EMAIL_STYLE = (
     ".pd-body p{margin:0 0 12px 0;}"
     ".pd-body a{color:#4f46e5;text-decoration:none;}"
     "@media (prefers-color-scheme:dark){"
-    ".pd-wrap{color:#e5e7eb;}"
-    ".pd-body h2{border-bottom-color:#374151;}"
+    ".pd-wrap{color:#e5e7eb !important;}"
+    ".pd-body h2{border-bottom-color:#374151 !important;color:#f3f4f6 !important;}"
+    ".pd-body h3{color:#f3f4f6 !important;}"
     ".pd-meta,.pd-foot{color:#9ca3af !important;}"
     ".pd-eyebrow,.pd-body a,.pd-listen{color:#818cf8 !important;}"
     ".pd-head,.pd-hr{border-color:#374151 !important;}"
@@ -1546,27 +1673,126 @@ _EMAIL_STYLE = (
     "</style>"
 )
 
+_INLINE_TAG_STYLES: dict[str, str] = {
+    "h2": "font-size:16px;font-weight:700;margin:22px 0 8px 0;padding-bottom:4px;border-bottom:1px solid #e5e7eb;",
+    "h3": "font-size:14px;font-weight:600;margin:16px 0 6px 0;",
+    "ul": "margin:8px 0 14px 0;padding-left:20px;",
+    "ol": "margin:8px 0 14px 0;padding-left:20px;",
+    "li": "margin:0 0 6px 0;",
+    "a": "color:#4f46e5;text-decoration:none;",
+}
+
+
+class _SummaryEmailRewriter(HTMLParser):
+    """Inline critical email styles and turn YouTube timestamps into deep links
+    without ever nesting `<a>` tags."""
+
+    def __init__(self, youtube_base: str | None) -> None:
+        super().__init__(convert_charrefs=False)
+        self._youtube_base = youtube_base
+        self._anchor_depth = 0
+        self._out: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        lower = tag.lower()
+        if lower == "a":
+            self._anchor_depth += 1
+        attr_list = list(attrs)
+        style = _INLINE_TAG_STYLES.get(lower)
+        if style and not any(k.lower() == "style" for k, _ in attr_list):
+            attr_list.append(("style", style))
+        rendered = "".join(
+            f' {k}="{_escape(v)}"' if v is not None else f" {k}"
+            for k, v in attr_list
+        )
+        self._out.append(f"<{lower}{rendered}>")
+
+    def handle_endtag(self, tag: str) -> None:
+        lower = tag.lower()
+        if lower == "a" and self._anchor_depth > 0:
+            self._anchor_depth -= 1
+        self._out.append(f"</{lower}>")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        lower = tag.lower()
+        rendered = "".join(
+            f' {k}="{_escape(v)}"' if v is not None else f" {k}"
+            for k, v in attrs
+        )
+        self._out.append(f"<{lower}{rendered}/>")
+
+    def handle_data(self, data: str) -> None:
+        if self._youtube_base and self._anchor_depth == 0:
+            base = self._youtube_base
+
+            def _replace(match: re.Match[str]) -> str:
+                hh = int(match.group(1) or 0)
+                mm = int(match.group(2))
+                ss = int(match.group(3))
+                total_seconds = hh * 3600 + mm * 60 + ss
+                href = f"{base}&t={total_seconds}s"
+                return (
+                    f'<a href="{_escape(href)}" rel="noopener noreferrer" '
+                    f'style="color:#4f46e5;text-decoration:none;">'
+                    f"{_escape(match.group(0))}</a>"
+                )
+
+            # Escape non-matching segments so raw text stays valid HTML.
+            last = 0
+            parts: list[str] = []
+            for m in _YOUTUBE_TS_TEXT_RE.finditer(data):
+                if m.start() > last:
+                    parts.append(_escape(data[last : m.start()]))
+                parts.append(_replace(m))
+                last = m.end()
+            if last < len(data):
+                parts.append(_escape(data[last:]))
+            self._out.append("".join(parts))
+        else:
+            self._out.append(_escape(data))
+
+    def handle_entityref(self, name: str) -> None:
+        self._out.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        self._out.append(f"&#{name};")
+
+    def result(self) -> str:
+        return "".join(self._out)
+
 
 def _link_youtube_timestamps(body_html: str, audio_url: str) -> str:
     """Turn `[hh:mm:ss]` highlight markers into clickable YouTube deep links."""
-    if not youtube.is_youtube_url(audio_url):
-        return body_html
-    try:
-        video_id = youtube.extract_video_id(audio_url)
-    except youtube.FeedError:
-        return body_html
-    base = youtube.canonical_watch_url(video_id)
+    youtube_base: str | None = None
+    if youtube.is_youtube_url(audio_url):
+        try:
+            video_id = youtube.extract_video_id(audio_url)
+            youtube_base = youtube.canonical_watch_url(video_id)
+        except youtube.FeedError:
+            youtube_base = None
+    rewriter = _SummaryEmailRewriter(youtube_base)
+    rewriter.feed(body_html)
+    rewriter.close()
+    return rewriter.result()
 
-    def _replace(match: re.Match[str]) -> str:
-        hh, mm, ss = int(match.group(1)), int(match.group(2)), int(match.group(3))
-        total_seconds = hh * 3600 + mm * 60 + ss
-        href = f"{base}&t={total_seconds}s"
-        return (
-            f'<a href="{_escape(href)}" rel="noopener noreferrer">'
-            f"{match.group(0)}</a>"
-        )
 
-    return _YOUTUBE_TS_RE.sub(_replace, body_html)
+_TLDR_P_RE = re.compile(
+    r"<h2[^>]*>\s*TL;DR\s*</h2>\s*<p[^>]*>(.*?)</p>",
+    re.IGNORECASE | re.DOTALL,
+)
+_FIRST_P_RE = re.compile(r"<p[^>]*>(.*?)</p>", re.IGNORECASE | re.DOTALL)
+
+
+def _extract_preheader(summary_html: str) -> str:
+    """Extract a concise plain-text preheader from TL;DR (or the first paragraph)."""
+    match = _TLDR_P_RE.search(summary_html) or _FIRST_P_RE.search(summary_html)
+    if not match:
+        return ""
+    text = _html_to_text(match.group(1), include_links=False).strip()
+    text = " ".join(text.split())
+    if len(text) > 160:
+        text = text[:159].rstrip() + "…"
+    return text
 
 
 def _wrap_email(
@@ -1585,7 +1811,8 @@ def _wrap_email(
     The header carries the podcast name, title, release date, runtime, and any
     translation note. The model summary is sanitized at production and
     re-sanitized here (see sanitize.py) before adding clickable YouTube
-    timestamps — the email is the outward surface, so it never trusts storage.
+    timestamps and inline email styles — the email is the outward surface, so
+    it never trusts storage.
     """
     meta_bits: list[str] = []
     released = _fmt_release_date(published_at)
@@ -1606,10 +1833,14 @@ def _wrap_email(
     safe_url = safe_listen_url(audio_url)
     footer_bits: list[str] = []
     if safe_url:
+        cta_label = (
+            "Watch on YouTube" if youtube.is_youtube_url(safe_url)
+            else "Listen to the episode"
+        )
         footer_bits.append(
             f'<a class="pd-listen" href="{_escape(safe_url)}" '
             f'style="color:#4f46e5;font-weight:600;text-decoration:none;">'
-            f"Listen to the episode</a>"
+            f"{cta_label}</a>"
         )
     if transcript_source == "publisher":
         footer_bits.append("Summarized from the publisher's transcript")
@@ -1620,8 +1851,8 @@ def _wrap_email(
     )
     if generated_by is not None:
         footer += (
-            f'<p class="pd-foot" style="color:#9ca3af;font-size:11px;margin:0;'
-            f'overflow-wrap:anywhere;">'
+            f'<p class="pd-foot" style="color:#6b7280;font-size:11px;margin:0;'
+            f'overflow-wrap:break-word;">'
             f"Generated by {_escape(generated_by.service)} {_escape(generated_by.version)}, "
             f"source revision {_escape(generated_by.source_revision)}.</p>"
         )
@@ -1631,16 +1862,42 @@ def _wrap_email(
             f'margin:24px 0 16px 0;">{footer}'
         )
 
-    clean_summary = _link_youtube_timestamps(sanitize_summary_html(summary_html), audio_url)
-    return (
-        f"{_EMAIL_STYLE}"
-        f'<div class="pd-wrap" style="max-width:680px;margin:0 auto;'
-        f"font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;"
-        f'font-size:15px;line-height:1.6;">'
-        f'<div class="pd-head" style="border-bottom:1px solid #e5e7eb;'
-        f'padding-bottom:14px;margin-bottom:20px;">'
+    sanitized = sanitize_summary_html(summary_html)
+    preheader_text = _extract_preheader(sanitized)
+    preheader_html = (
+        f'<div class="pd-preheader" style="display:none;max-height:0;overflow:hidden;'
+        f'opacity:0;mso-hide:all;font-size:1px;line-height:1px;">'
+        f"{_escape(preheader_text)}&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;</div>"
+        if preheader_text else ""
+    )
+
+    show_eyebrow = bool(
+        podcast.strip() and podcast.strip().casefold() != title.strip().casefold()
+    )
+    eyebrow_html = (
         f'<p class="pd-eyebrow" style="font-size:12px;font-weight:600;letter-spacing:0.04em;'
         f'text-transform:uppercase;color:#4f46e5;margin:0 0 4px 0;">{_escape(podcast)}</p>'
+        if show_eyebrow else ""
+    )
+
+    clean_summary = _link_youtube_timestamps(sanitized, audio_url)
+    return (
+        f"<!DOCTYPE html><html><head>"
+        f'<meta charset="utf-8">'
+        f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f'<meta name="color-scheme" content="light dark">'
+        f'<meta name="supported-color-schemes" content="light dark">'
+        f"{_EMAIL_STYLE}</head>"
+        f'<body style="margin:0;padding:0;">'
+        f"{preheader_html}"
+        f'<!--[if mso]><table role="presentation" width="680" align="center" '
+        f'cellpadding="0" cellspacing="0" border="0"><tr><td><![endif]-->'
+        f'<div class="pd-wrap" style="max-width:680px;margin:0 auto;padding:16px;'
+        f"font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;"
+        f'font-size:15px;line-height:1.6;color:#1f2937;">'
+        f'<div class="pd-head" style="border-bottom:1px solid #e5e7eb;'
+        f'padding-bottom:14px;margin-bottom:20px;">'
+        f"{eyebrow_html}"
         f'<p style="margin:0 0 8px 0;font-size:20px;line-height:1.3;font-weight:700;">'
         f"<strong>{_escape(title)}</strong></p>"
         f"{meta_line}"
@@ -1648,6 +1905,8 @@ def _wrap_email(
         f'<div class="pd-body">{clean_summary}</div>'
         f"{footer}"
         f"</div>"
+        f"<!--[if mso]></td></tr></table><![endif]-->"
+        f"</body></html>"
     )
 
 

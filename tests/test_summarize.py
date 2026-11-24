@@ -405,3 +405,104 @@ def test_billing_refusal_is_summarizer_unavailable(monkeypatch):
     with pytest.raises(SummarizerUnavailable) as ei:
         api.complete(system="s", prompt="p", purpose="summarize")
     assert ei.value.reason == "config_error"
+
+
+@pytest.mark.parametrize("served_model", [
+    "claude-sonnet-5-5",
+    "gpt-6.2-sol",
+    "gemini-4-hydrogen-xhigh",
+])
+def test_anthropic_alias_accepts_physical_served_model_and_forwards_effort(
+    monkeypatch, caplog, served_model,
+):
+    sent: list[dict] = []
+
+    class Messages:
+        def create(self, **kw):
+            sent.append(kw)
+            block = types.SimpleNamespace(type="text", text="<h2>TL;DR</h2><p>Summary.</p>")
+            return types.SimpleNamespace(
+                model=served_model,
+                content=[block],
+                stop_reason="end_turn",
+                usage=types.SimpleNamespace(input_tokens=10, output_tokens=20, cache_read_input_tokens=0),
+            )
+
+    class FakeAnthropic:
+        def __init__(self, **kw):
+            self.messages = Messages()
+
+    monkeypatch.setitem(sys.modules, "anthropic", types.SimpleNamespace(Anthropic=FakeAnthropic))
+    api = ApiCompleter(
+        model="fleet-daily",
+        provider="anthropic",
+        effort="high",
+        anthropic_api_key="synthetic-key",
+    )
+    with caplog.at_level("INFO"):
+        html = summarize(_input(), completer=api)
+    assert html == "<h2>TL;DR</h2><p>Summary.</p>"
+    assert len(sent) == 1
+    assert sent[0]["model"] == "fleet-daily"
+    assert sent[0]["extra_body"] == {"output_config": {"effort": "high"}}
+    assert f"served={served_model}" in caplog.text
+
+
+@pytest.mark.parametrize("bad_model", [None, "", "fleet-daily"])
+def test_anthropic_alias_rejects_missing_or_unexpanded_served_model(monkeypatch, bad_model):
+    class Messages:
+        def create(self, **kw):
+            block = types.SimpleNamespace(type="text", text="<h2>TL;DR</h2><p>Summary.</p>")
+            return types.SimpleNamespace(
+                model=bad_model,
+                content=[block],
+                stop_reason="end_turn",
+                usage=types.SimpleNamespace(input_tokens=10, output_tokens=20, cache_read_input_tokens=0),
+            )
+
+    class FakeAnthropic:
+        def __init__(self, **kw):
+            self.messages = Messages()
+
+    monkeypatch.setitem(sys.modules, "anthropic", types.SimpleNamespace(Anthropic=FakeAnthropic))
+    api = ApiCompleter(model="fleet-daily", provider="anthropic", anthropic_api_key="synthetic-key")
+    with pytest.raises(UnusableReply, match="did not identify the model actually served"):
+        api.complete(system="s", prompt="p", purpose="summarize")
+
+
+@pytest.mark.parametrize("exc_name,status", [
+    ("RateLimitError", 429),
+    ("APITimeoutError", None),
+])
+def test_anthropic_alias_rate_limit_and_timeout_do_not_retry_in_completer(
+    monkeypatch, exc_name, status,
+):
+    exc_type = type(exc_name, (Exception,), {})
+    calls = {"n": 0}
+
+    class Messages:
+        def create(self, **kw):
+            calls["n"] += 1
+            err = exc_type("upstream unavailable")
+            if status is not None:
+                err.status_code = status
+            raise err
+
+    class FakeAnthropic:
+        def __init__(self, **kw):
+            self.messages = Messages()
+
+    monkeypatch.setitem(sys.modules, "anthropic", types.SimpleNamespace(Anthropic=FakeAnthropic))
+    api = ApiCompleter(model="fleet-daily", provider="anthropic", anthropic_api_key="synthetic-key")
+    with pytest.raises(SummarizerUnavailable) as ei:
+        api.complete(system="s", prompt="p", purpose="summarize")
+    assert ei.value.reason == "api_unavailable"
+    assert calls["n"] == 1
+
+
+def test_invalid_effort_is_a_config_problem():
+    api = ApiCompleter(model="fleet-daily", provider="anthropic", effort="bogus", anthropic_api_key="k")
+    assert "effort" in (api.config_problem() or "")
+    with pytest.raises(SummarizerUnavailable) as ei:
+        api.complete(system="s", prompt="p", purpose="summarize")
+    assert ei.value.reason == "config_error"

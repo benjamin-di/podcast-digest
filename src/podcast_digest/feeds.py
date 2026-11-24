@@ -19,7 +19,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import feedparser
 import httpx
@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
 HTTP_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 SYNTHETIC_GUID_PREFIX = "synthetic:v1:"
+MAX_PAGE_BYTES = 32 * 1024 * 1024  # 32 MiB ceiling for RSS/HTML metadata pages
 
 
 @dataclass(frozen=True)
@@ -129,18 +130,42 @@ async def resolve_feed_url(feed: Feed, *, client: httpx.AsyncClient) -> tuple[st
 # ---------------------------------------------------------------------------
 
 
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_MAX_REDIRECTS = 5
+
+
 async def fetch_page(url: str, *, client: httpx.AsyncClient) -> bytes:
     """Download a page body over the guarded client.
 
+    Follows validated redirects explicitly with ``follow_redirects=False`` so
+    intermediate redirect bodies are closed without buffering into memory.
     Some hosts (e.g. Substack behind Cloudflare) fingerprint-block httpx's TLS
     stack with a 403/429 while serving `curl` fine. For those we fall back to a
     curl subprocess (curl ships in the image) rather than giving up.
     """
-    await validate_outbound_url_async(url)
+    current = url
     try:
-        r = await client.get(url, headers={"User-Agent": USER_AGENT})
-        r.raise_for_status()
-        return r.content
+        for hop in range(_MAX_REDIRECTS + 1):
+            await validate_outbound_url_async(current)
+            async with client.stream(
+                "GET", current, headers={"User-Agent": USER_AGENT}, follow_redirects=False,
+            ) as r:
+                location = r.headers.get("location")
+                if r.status_code in _REDIRECT_STATUSES and location:
+                    if hop >= _MAX_REDIRECTS:
+                        raise FeedError(f"too many redirects fetching {url}")
+                    current = urljoin(current, location)
+                    continue
+                r.raise_for_status()
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in r.aiter_bytes():
+                    size += len(chunk)
+                    if size > MAX_PAGE_BYTES:
+                        raise FeedError(f"response from {current} exceeded {MAX_PAGE_BYTES} byte limit")
+                    chunks.append(chunk)
+                return b"".join(chunks)
+        raise FeedError(f"too many redirects fetching {url}")
     except httpx.HTTPStatusError as e:
         if e.response.status_code not in (403, 429):
             raise
@@ -191,6 +216,7 @@ async def _fetch_rss_curl(rss_url: str) -> bytes:
         await fetch_to_file(
             rss_url, dest=tmp, user_agent=USER_AGENT,
             max_time="30", timeout=45.0, label="curl rss",
+            max_bytes=MAX_PAGE_BYTES,
         )
         out = tmp.read_bytes()
     except (CurlFetchError, SubprocessTimeout) as e:

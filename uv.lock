@@ -1122,7 +1122,7 @@ wheels = [
 
 [[package]]
 name = "podcast-digest"
-version = "1.4.2"
+version = "1.7.1"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },

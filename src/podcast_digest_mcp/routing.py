@@ -28,7 +28,9 @@ from urllib.parse import (
 
 import httpx
 
+from podcast_digest.feeds import FeedError
 from podcast_digest.net import validate_outbound_url
+from podcast_digest.youtube import canonical_watch_url, extract_video_id
 
 # Share / analytics query params that never affect what gets fetched. Stripped
 # from a URL before it's stored so feeds.toml stays clean (and so the per-share
@@ -60,7 +62,7 @@ YOUTUBE_HOSTS = frozenset({
     "music.youtube.com", "youtu.be", "youtube-nocookie.com",
 })
 
-APPLE_PODCAST_PATH = re.compile(r"/podcast/[^/]+/id(\d+)$")
+APPLE_PODCAST_PATH = re.compile(r"/podcast/(?:[^/]+/)?id(\d+)/?$")
 
 
 @dataclass(frozen=True)
@@ -126,9 +128,15 @@ def classify(url: str, *, http: httpx.Client) -> Classification:
 
     # YouTube — distinguish a single watch URL from a channel URL.
     if host in YOUTUBE_HOSTS:
-        # /watch?v=, /shorts/, /live/, /embed/, youtu.be/<id> → single video
+        # /watch?v=, /shorts/<id>, /live/<id>, /embed/<id>, youtu.be/<id> → single video
         if host == "youtu.be" or _WATCH_RE.match(p.path):
-            return Classification(kind="youtube_video", canonical=url, extra={})
+            try:
+                video_id = extract_video_id(url)
+            except (ValueError, FeedError) as e:
+                raise ValueError(f"unrecognised YouTube video URL: {url}") from e
+            return Classification(
+                kind="youtube_video", canonical=canonical_watch_url(video_id), extra={},
+            )
         # /@handle, /c/<name>, /channel/<UC...>, /user/<name> → channel
         return Classification(kind="youtube_channel", canonical=url, extra={})
 

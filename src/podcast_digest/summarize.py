@@ -191,6 +191,9 @@ def summarize(
     return _normalize_summary_html(html)
 
 
+_H2_TAG_RE = re.compile(r"<h2(?:\s[^>]*)?>", re.IGNORECASE)
+
+
 def _normalize_summary_html(text: str) -> str:
     """Return the usable HTML fragment from an otherwise valid reply.
 
@@ -201,9 +204,10 @@ def _normalize_summary_html(text: str) -> str:
     """
     body = _strip_code_fence(strip_reasoning(text)).strip()
     if not body.startswith("<"):
-        first_heading = body.find("<h2>")
-        if first_heading >= 0:
-            body = body[first_heading:]
+        match = _H2_TAG_RE.search(body)
+        if match is not None:
+            body = body[match.start():]
+    body = re.sub(r"\n?```\s*$", "", body).strip()
     return body
 
 
@@ -221,10 +225,10 @@ def _validate_summary_html(text: str) -> str | None:
     with a pointer ("The HTML fragment is ready in /tmp/summary.html") — which,
     unchecked, ships verbatim as the email body. Returns a short problem
     description, or None if the text looks right."""
-    problem = _validate_custom_html(text)
-    if problem:
-        return problem
-    if "<h2>" not in _normalize_summary_html(text):
+    normalized = _normalize_summary_html(text)
+    if not normalized.startswith("<"):
+        return "does not start with an HTML tag"
+    if not _H2_TAG_RE.search(normalized):
         return "missing required <h2> sections"
     return None
 
@@ -271,6 +275,14 @@ def _language_guidance(lang: str, style: Style = "general") -> str:
     )
 
 
+def _clean_show_notes(description: str | None) -> str:
+    """Strip HTML and trim show notes to a compact hint for the model."""
+    if not description:
+        return ""
+    desc = re.sub(r"<[^>]+>", " ", description)
+    return re.sub(r"\s+", " ", desc).strip()[:1500]
+
+
 def _build_user_message(inp: SummarizationInput, *, style: Style = "general") -> str:
     header_lines = [
         f"Podcast: {inp.podcast_name}",
@@ -280,10 +292,8 @@ def _build_user_message(inp: SummarizationInput, *, style: Style = "general") ->
         header_lines.append(f"Published: {inp.published_at}")
     if inp.duration_seconds:
         header_lines.append(f"Duration: {_fmt_dur(inp.duration_seconds)}")
-    if inp.description:
-        # Trim show notes; we just want a hint for the model, not the world.
-        desc = re.sub(r"<[^>]+>", " ", inp.description)
-        desc = re.sub(r"\s+", " ", desc).strip()[:1500]
+    desc = _clean_show_notes(inp.description)
+    if desc:
         header_lines.append(f"Show notes: {desc}")
     if inp.source_language:
         header_lines.append(_language_guidance(inp.source_language, style))
@@ -336,13 +346,25 @@ def strip_reasoning(s: str) -> str:
     return _REASONING_RE.sub("", s, count=1)
 
 
-_CODE_FENCE_RE = re.compile(r"^```(?:html|markdown|md)?\s*\n(.*)\n```\s*$", re.DOTALL)
+_CODE_FENCE_RE = re.compile(
+    r"^```(?:html|markdown|md)?\s*\n(.*)\n```\s*$", re.DOTALL | re.IGNORECASE,
+)
+_PREAMBLE_FENCE_RE = re.compile(
+    r"```(?:html|markdown|md)?\s*\n(.*)\n```\s*$", re.DOTALL | re.IGNORECASE,
+)
 
 
 def _strip_code_fence(s: str) -> str:
     """If the model wrapped the output in ```html ... ```, peel it off."""
-    m = _CODE_FENCE_RE.match(s.strip())
-    return m.group(1).strip() if m else s
+    stripped = s.strip()
+    m = _CODE_FENCE_RE.match(stripped)
+    if m:
+        return m.group(1).strip()
+    if not stripped.startswith("<"):
+        m2 = _PREAMBLE_FENCE_RE.search(stripped)
+        if m2 and m2.group(1).lstrip().startswith("<"):
+            return m2.group(1).strip()
+    return s
 
 
 # ---------------------------------------------------------------------------
@@ -458,12 +480,16 @@ def clean_transcript(
     )
     started = time.perf_counter()
 
+    show_notes = _clean_show_notes(inp.description)
+    notes_line = f"Show notes: {show_notes}\n" if show_notes else ""
+
     def _clean_chunk(idx_chunk: tuple[int, str]) -> str | None:
         """Clean one chunk. Returns None only when ``allow_partial`` and the
         chunk failed (caller substitutes a marker); otherwise re-raises."""
         i, chunk = idx_chunk
         header = (
             f"Podcast: {inp.podcast_name}\nEpisode: {inp.title}\n"
+            f"{notes_line}"
             f"(transcript chunk {i} of {n})\n\n--- CHUNK ---\n\n"
         )
         try:
@@ -471,7 +497,10 @@ def clean_transcript(
                 system=CLEANUP_SYSTEM_PROMPT, prompt=header + chunk,
                 purpose="clean", guid=guid,
             )
-            return _strip_code_fence(strip_reasoning(part)).strip()
+            cleaned = _strip_code_fence(strip_reasoning(part)).strip()
+            if not cleaned:
+                raise RuntimeError(f"clean_transcript: chunk {i} of {n} returned empty content")
+            return cleaned
         except Exception as e:  # noqa: BLE001
             if not allow_partial:
                 raise

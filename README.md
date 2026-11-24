@@ -179,6 +179,7 @@ A changed mailbox/backend cannot take over an existing operation.
 |---|---|---|
 | `PODCAST_DIGEST_SUMMARIZER` | `api` | `api` or `command` |
 | `PODCAST_DIGEST_MODEL` | `claude-opus-5-5` | `api`: the model. `claude-*` uses Anthropic (`claude-sonnet-5-5` is cheaper), anything else OpenAI or a compatible server |
+| `PODCAST_DIGEST_MODEL_EFFORT` | unset | Optional Anthropic Messages reasoning effort (`low`, `medium`, `high`) for API summarization and transcript cleanup |
 | `PODCAST_DIGEST_PROVIDER` | `auto` | Force `anthropic` or `openai` |
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | | The provider's key (or `*_FILE` to read from a mounted secret file; `PODCAST_DIGEST_SMTP_PASSWORD_FILE`, `PODCAST_DIGEST_GRAPH_CLIENT_SECRET_FILE`, and `PODCAST_DIGEST_WEBHOOK_TOKEN_FILE` work the same way) |
 | `PODCAST_DIGEST_OPENAI_BASE_URL` | | An OpenAI-compatible server, e.g. `http://localhost:11434/v1` for Ollama (no key needed) |
@@ -339,13 +340,13 @@ itself; it writes the file and wakes the scheduler, which starts within ~15 s.
 
 | Tool | |
 |---|---|
-| `ingest(url, name?, min_minutes?, language?)` | Subscribe to a URL (see below); detects non-English feeds |
+| `ingest(url, name?, min_minutes?, language?)` | Subscribe to a URL (see below); detects non-English feeds (`min_minutes=0` disables duration filtering) |
 | `preview(url)` | Dry run: what `ingest` would add, with the latest episode titles |
 | `subscription_list(include_completed_oneoffs?)` / `subscription_remove(name)` | List or remove entries (hides completed one-offs by default when `PODCAST_DIGEST_DATA_DIR` is mounted) |
 | `process_now()` | Run a tick now |
 | `digest_status(limit?)` | Read-only pipeline status: stage counts, recent deliveries, in-progress episodes, held deliveries, and feed errors |
-| `search_transcripts(query, feed?, limit?)` | Search saved summaries and transcripts by keyword(s) |
-| `get_episode(query_or_guid, include_transcript?, max_chars?, offset?)` | Read an episode's summary and paginated transcript (`.clean.md` preferred, `.txt` fallback) |
+| `search_transcripts(query, feed?, limit?)` | Search saved summaries and transcripts by keyword(s) or phrase (FTS5 with CJK substring fallback) |
+| `get_episode(query_or_guid, feed?, include_transcript?, max_chars?, offset?)` | Read an episode's summary and paginated transcript (`.clean.md` preferred, `.txt` fallback; optional `feed` disambiguates colliding GUIDs) |
 
 | URL | Becomes |
 |---|---|

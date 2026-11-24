@@ -116,7 +116,10 @@ def test_delivery_recovery_obeys_tick_lock(settings, monkeypatch, capsys):
     lock = _acquire_tick_lock(settings)
     assert lock is not None
     try:
-        assert main(["delivery", "list"]) == 1
+        # Read-only inspection commands do not require the exclusive tick lock.
+        assert main(["delivery", "list"]) == 0
+        capsys.readouterr()
+        assert main(["delivery", "reconcile", "op-1", "--graph-message-id", "synthetic"]) == 1
         assert "another tick or recovery command" in capsys.readouterr().err
     finally:
         lock.close()

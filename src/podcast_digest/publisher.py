@@ -22,6 +22,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import math
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -219,6 +220,8 @@ def _parse_json(text: str) -> list[Segment]:
             end = float(seg.get("endTime", start))
         except (KeyError, TypeError, ValueError):
             continue
+        if not (math.isfinite(start) and math.isfinite(end)) or start < 0 or end < 0:
+            continue
         if body:
             speaker = str(seg.get("speaker") or "").strip() or None
             segments.append(Segment(start=start, end=max(start, end), text=body, speaker=speaker))
@@ -287,9 +290,20 @@ def parse(body: str, fmt: str) -> Transcript:
     return Transcript(text=" ".join(s.text for s in segments), segments=segments)
 
 
+_CJK_CHAR_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
+
+
+def _word_count(text: str) -> int:
+    """Count word-equivalents across both whitespace-delimited and CJK scripts."""
+    cjk_chars = len(_CJK_CHAR_RE.findall(text))
+    non_cjk_words = len(_CJK_CHAR_RE.sub(" ", text).split())
+    # Roughly 1.5–2 CJK characters per spoken word; count 1 word per 2 CJK chars.
+    return non_cjk_words + (cjk_chars // 2)
+
+
 def implausible(transcript: Transcript, *, declared_seconds: int | None) -> str | None:
     """Why this transcript cannot stand in for the episode, or None."""
-    words = len(transcript.text.split())
+    words = _word_count(transcript.text)
     minutes = (declared_seconds or 0) / 60
     floor = max(MIN_WORDS, int(minutes * MIN_WORDS_PER_MINUTE))
     if words < floor:

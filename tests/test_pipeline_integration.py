@@ -920,7 +920,7 @@ async def test_audio_url_full_pipeline_and_idempotent(
     assert stats == {"feeds": 1, "new_episodes": 1, "emailed": 1, "failed": 0,
                      "summarize_failed": 0, "summarize_ok": 1}
     assert len(mailer.sent) == 1
-    assert mailer.sent[0]["subject"].startswith("[Podcast] Random Clip — Random Clip")
+    assert mailer.sent[0]["subject"].startswith("[Podcast] Random Clip")
     assert audio in mailer.sent[0]["body_html"]
 
     guid = f"audio:{hashlib.sha1(audio.encode()).hexdigest()[:16]}"

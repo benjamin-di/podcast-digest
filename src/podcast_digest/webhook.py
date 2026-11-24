@@ -23,6 +23,28 @@ from .net import upload_timeout
 logger = logging.getLogger(__name__)
 
 
+MAX_ACK_BODY_BYTES = 64 * 1024
+MAX_ERROR_BODY_BYTES = 2048
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse HTTP redirects on webhook POSTs so Authorization is never leaked
+    and a 301/302/303 cannot silently turn a POST into a GET 200."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        raise urllib.error.HTTPError(
+            req.full_url, code, f"redirect refused ({msg})", headers, fp,
+        )
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
+def _open(req: urllib.request.Request, *, timeout: float):  # type: ignore[no-untyped-def]
+    """Always use the no-redirect opener so Authorization is never forwarded."""
+    return _NO_REDIRECT_OPENER.open(req, timeout=timeout)
+
+
 class WebhookError(RuntimeError):
     """The receiver returned a non-2xx response, did not acknowledge, or the
     request failed."""
@@ -83,8 +105,11 @@ class WebhookClient:
         # multi-MB body. `self.timeout` is the floor.
         timeout = upload_timeout(len(body), base=float(self.timeout))
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                payload = _parse(resp.read())
+            with _open(req, timeout=timeout) as resp:
+                status = getattr(resp, "status", 200)
+                if not (200 <= status < 300):
+                    raise WebhookError(f"webhook failed: unexpected HTTP {status}")
+                payload = _parse(_read_bounded(resp, MAX_ACK_BODY_BYTES + 1)) if self.ack_field else {}
         except urllib.error.HTTPError as e:
             raise WebhookError(f"webhook failed: HTTP {e.code} {_safe_read(e)}") from e
         except urllib.error.URLError as e:
@@ -115,8 +140,15 @@ def _parse(raw: bytes) -> dict:
         return {}
 
 
+def _read_bounded(stream: Any, limit: int) -> bytes:
+    try:
+        return bytes(stream.read(limit))
+    except TypeError:
+        return bytes(stream.read())[:limit]
+
+
 def _safe_read(e: urllib.error.HTTPError) -> str:
     try:
-        return e.read().decode("utf-8", errors="replace")[:500]
+        return _read_bounded(e, MAX_ERROR_BODY_BYTES).decode("utf-8", errors="replace")[:500]
     except Exception:
         return ""
