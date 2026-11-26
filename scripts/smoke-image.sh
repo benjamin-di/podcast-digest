@@ -26,6 +26,7 @@ case "$variant" in
         test "$LOCAL_TRANSCRIBER_SOURCE_REV" = "$EXPECTED_REVISION"
         python -c "import torch, openvino, local_transcriber"
         LD_LIBRARY_PATH="$WHISPER_LD_PATH" whisper-cli --help >/dev/null
+        LD_LIBRARY_PATH="$WHISPER_LD_PATH" whisper-server --help >/dev/null
         local-transcribe --help >/dev/null
         if [ "$SMOKE_VARIANT" = podcast ]; then
           python -c '\''import importlib.metadata, os; assert importlib.metadata.version("podcast-digest") == os.environ["EXPECTED_VERSION"]'\''

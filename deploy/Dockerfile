@@ -43,7 +43,7 @@ WORKDIR /src/whisper.cpp
 # (any x86-64 CPU since ~2013; with an iGPU the heavy encode runs via OpenVINO,
 # so the CPU backend loses nothing) to make every rebuild deterministic.
 RUN bash -lc '. /opt/intel/openvino/setupvars.sh && \
-    cmake -B build -DCMAKE_BUILD_TYPE=Release -DWHISPER_OPENVINO=1 \
+    cmake -B build -DCMAKE_BUILD_TYPE=Release -DWHISPER_OPENVINO=1 -DWHISPER_BUILD_SERVER=ON \
           -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON && \
     cmake --build build -j"$(nproc)" --config Release && \
     mkdir -p /whisperlibs && \
@@ -81,17 +81,18 @@ RUN apt-get update && apt-get upgrade -y --no-install-recommends && apt-get inst
 
 # whisper.cpp artifacts
 COPY --from=whisper-builder /src/whisper.cpp/build/bin/whisper-cli /usr/local/bin/whisper-cli
+COPY --from=whisper-builder /src/whisper.cpp/build/bin/whisper-server /usr/local/bin/whisper-server
 COPY --from=whisper-builder /src/whisper.cpp/models/download-ggml-model.sh /usr/local/bin/download-ggml-model.sh
 # Vendored converter (drops whisper.cpp's dead `openvino.tools.mo` import, which
 # 404s on OpenVINO 2024.x) so the iGPU OpenVINO encoder IR is produced.
 COPY deploy/convert-whisper-to-openvino.py /usr/local/bin/convert-whisper-to-openvino.py
-# whisper-cli is dynamically linked against libwhisper.so / libggml*.so (built
+# whisper-cli and whisper-server are dynamically linked against libwhisper.so / libggml*.so (built
 # in stage 1). Ship them and register the dir with the loader. The OpenVINO
-# runtime libs whisper-cli also needs are NOT added system-wide (they conflict
+# runtime libs whisper also needs are NOT added system-wide (they conflict
 # with the Python process); they're injected only for the whisper subprocess
 # via PODCAST_DIGEST_WHISPER_LD_PATH (see below + transcribe.py).
 COPY --from=whisper-builder /whisperlibs/ /usr/local/lib/whisper/
-RUN chmod +x /usr/local/bin/whisper-cli /usr/local/bin/download-ggml-model.sh \
+RUN chmod +x /usr/local/bin/whisper-cli /usr/local/bin/whisper-server /usr/local/bin/download-ggml-model.sh \
  && echo "/usr/local/lib/whisper" > /etc/ld.so.conf.d/whisper.conf \
  && ldconfig
 

@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.8.1] - 2026-11-26
+
+### Fixed
+
+- Exclude private CI release test `tests/test_ci_release.py` from public mirror exports and use native containerd BuildKit store in `ci-release.sh`.
+
+### Upgrade
+
+- Action required: none.
+- Rollback: compatible with 1.8.0. Existing databases, delivery journals, and transcripts remain readable.
+
+## [1.8.0] - 2026-11-25
+
+### Added
+
+- Bundle `whisper-server` (built with OpenVINO support from the same `whisper.cpp` stage) alongside `whisper-cli` in the `local-transcriber` and `podcast-digest` images, and smoke-check `whisper-server --help` before image promotion.
+
+### Upgrade
+
+- Action required: none.
+- Rollback: compatible with 1.7.x. Existing databases, delivery journals, and transcripts remain readable.
+
 ## [1.7.1] - 2026-11-24
 
 ### Fixed
